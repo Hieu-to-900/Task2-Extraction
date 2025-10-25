@@ -139,6 +139,7 @@ class VietnameseMCQRAG:
         self.config = config or RAGConfig()
         self.logger = Logger()
         self.index = None
+        self.retriever = None  # Add retriever attribute
         self.query_engine = None
         self.generation_model = None
         self.tokenizer = None
@@ -291,41 +292,27 @@ class VietnameseMCQRAG:
         self.logger.log_info("Vector index created and persisted successfully")
     
     def setup_query_engine(self):
-        """Setup query engine with custom prompt for MCQ"""
+        """Setup query engine - bypass LlamaIndex LLM, use retrieval only"""
         self.logger.log_info("Setting up query engine...")
         
-        # Custom prompt template for Vietnamese MCQ
-        mcq_prompt_template = PromptTemplate(
-            """Bạn là một trợ lý AI chuyên trả lời câu hỏi trắc nghiệm tiếng Việt.
-
-Context thông tin:
-{context_str}
-
-Câu hỏi: {query_str}
-
-Hướng dẫn:
-1. Đọc kỹ context và câu hỏi
-2. Phân tích từng lựa chọn dựa trên thông tin trong context
-3. Trả lời theo định dạng chính xác: "Đáp án đúng: [danh sách các đáp án]" (ví dụ: "Đáp án đúng: A, C")
-4. Nếu không tìm thấy thông tin trong context, trả lời: "Không có thông tin đủ để trả lời"
-5. Chỉ chọn những đáp án được hỗ trợ bởi context
-
-Trả lời:"""
-        )
-        
-        # Create retriever
-        retriever = VectorIndexRetriever(
-            index=self.index,
-            similarity_top_k=self.config.TOP_K,
-        )
-        
-        # Create query engine
-        self.query_engine = RetrieverQueryEngine(
-            retriever=retriever,
-            response_synthesizer=None  # We'll handle generation manually
-        )
-        
-        self.logger.log_info("Query engine setup completed")
+        try:
+            # Set global LLM to None to disable OpenAI and bypass LLM complexity
+            Settings.llm = None
+            
+            # Create simple retriever for context extraction
+            retriever = VectorIndexRetriever(
+                index=self.index,
+                similarity_top_k=self.config.TOP_K,
+            )
+            
+            # Store retriever for manual context extraction
+            self.retriever = retriever
+            
+            self.logger.log_info("Query engine setup completed - using retrieval only approach")
+            
+        except Exception as e:
+            self.logger.log_error("Failed to setup query engine", e)
+            raise
     
     def generate_answer_with_phi3(self, context: str, question: str, options: Dict[str, str]) -> str:
         """Generate answer using Phi-3 model with GPU optimization"""
@@ -420,29 +407,24 @@ Trả lời:"""
         return []
     
     def answer_mcq(self, question: str, options: Dict[str, str]) -> List[str]:
-        """Answer a single MCQ question"""
+        """Answer a single MCQ question using retrieval + custom generation"""
         
         try:
             # Add query prefix for better retrieval
             query_with_prefix = f"query: {question}"
             
-            # Retrieve relevant context
-            retriever = VectorIndexRetriever(
-                index=self.index,
-                similarity_top_k=self.config.TOP_K,
-            )
-            
-            nodes = retriever.retrieve(query_with_prefix)
+            # Retrieve relevant context using our retriever
+            nodes = self.retriever.retrieve(query_with_prefix)
             
             # Combine context with passage prefix
             context_parts = []
             for node in nodes:
-                # Add passage prefix for embedding
+                # Add passage prefix for embedding consistency
                 context_parts.append(f"passage: {node.text}")
             
             context = "\n\n".join(context_parts)
             
-            # Generate answer
+            # Generate answer using our custom Phi-3 model
             response = self.generate_answer_with_phi3(context, question, options)
             
             # Parse answer
