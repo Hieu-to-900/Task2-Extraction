@@ -1,0 +1,24 @@
+# Core RAG framework
+llama-index==0.10.68
+llama-index-vector-stores-chroma==0.1.10
+llama-index-embeddings-huggingface==0.2.3
+
+# Vector database
+chromadb>=0.4.24
+
+# ML/AI libraries - GPU optimized for RTX 3090
+# torch>=2.0.0
+transformers>=4.35.0
+sentence-transformers>=2.2.2
+
+# Data processing
+pandas>=2.1.0
+numpy>=1.24.0
+
+# Utilities
+tqdm>=4.66.0
+python-dotenv>=1.0.0
+
+# GPU acceleration for RTX 3090
+accelerate>=0.24.0
+# flash-attn>=2.3.0  # Removed - compilation issues on Windows
