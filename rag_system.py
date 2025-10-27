@@ -25,12 +25,9 @@ from llama_index.core import (
 )
 from llama_index.core.node_parser import SentenceSplitter
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
-from llama_index.vector_stores.chroma import ChromaVectorStore
 from llama_index.core.prompts import PromptTemplate
 from llama_index.core.query_engine import RetrieverQueryEngine
 from llama_index.core.retrievers import VectorIndexRetriever
-
-import chromadb
 
 
 class RAGConfig:
@@ -55,7 +52,6 @@ class RAGConfig:
     TRUE_RESULTS_PATH = "true_result.md"
     
     # Storage
-    CHROMA_DB_PATH = "./chroma_db"
     INDEX_STORAGE_PATH = "./storage"
 
 
@@ -255,7 +251,7 @@ class VietnameseMCQRAG:
             raise
     
     def create_vector_index(self, documents: List, force_rebuild: bool = False):
-        """Create or load vector index with ChromaDB"""
+        """Create or load vector index with native LlamaIndex storage"""
         
         try:
             # Try to load existing index
@@ -265,18 +261,10 @@ class VietnameseMCQRAG:
                 self.index = load_index_from_storage(storage_context)
                 self.logger.log_info("Vector index loaded successfully")
                 return
-        except:
-            self.logger.log_info("Could not load existing index, creating new one...")
+        except Exception as e:
+            self.logger.log_info(f"Could not load existing index ({str(e)}), creating new one...")
         
-        self.logger.log_info("Creating new vector index with ChromaDB...")
-        
-        # Initialize ChromaDB
-        chroma_client = chromadb.PersistentClient(path=self.config.CHROMA_DB_PATH)
-        chroma_collection = chroma_client.get_or_create_collection("vietnamese_mcq")
-        
-        # Create vector store
-        vector_store = ChromaVectorStore(chroma_collection=chroma_collection)
-        storage_context = StorageContext.from_defaults(vector_store=vector_store)
+        self.logger.log_info("Creating new vector index with native LlamaIndex storage...")
         
         # Setup node parser for optimal chunking
         node_parser = SentenceSplitter(
@@ -285,14 +273,13 @@ class VietnameseMCQRAG:
         )
         Settings.node_parser = node_parser
         
-        # Create index
+        # Create index with default storage
         self.index = VectorStoreIndex.from_documents(
             documents,
-            storage_context=storage_context,
             show_progress=True
         )
         
-        # Persist index
+        # Persist index to storage directory
         self.index.storage_context.persist(persist_dir=self.config.INDEX_STORAGE_PATH)
         self.logger.log_info("Vector index created and persisted successfully")
     

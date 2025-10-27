@@ -5,7 +5,7 @@ llama-index-embeddings-huggingface==0.2.3
 llama-index-llms-huggingface==0.2.4
 
 # Vector database
-chromadb>=0.4.24
+# chromadb>=0.4.24
 
 # ML/AI libraries - GPU optimized for RTX 3090
 # torch>=2.0.0
