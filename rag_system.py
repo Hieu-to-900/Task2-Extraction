@@ -40,9 +40,14 @@ class RAGConfig:
     GENERATION_MODEL = "microsoft/Phi-3-mini-4k-instruct"
     
     # RAG parameters
-    TOP_K = 3
+    TOP_K = 7
     CHUNK_SIZE = 400  # Let LlamaIndex optimize based on model
     CHUNK_OVERLAP = 50
+    
+    # Performance modes
+    QUICK_MODE = False
+    ACCURATE_MODE = False
+    MAX_NEW_TOKENS = 150
     
     # File paths
     DOCUMENT_PATH = "answer_template.md"
@@ -352,11 +357,15 @@ Trả lời:"""
                 device = next(self.generation_model.parameters()).device
                 inputs = {k: v.to(device) for k, v in inputs.items()}
             
-            # Generate with optimized settings
+            # Generate with optimized settings based on performance mode
+            max_tokens = 50 if hasattr(self.config, 'QUICK_MODE') and self.config.QUICK_MODE else \
+                        200 if hasattr(self.config, 'ACCURATE_MODE') and self.config.ACCURATE_MODE else \
+                        self.config.MAX_NEW_TOKENS
+            
             with torch.no_grad():
                 outputs = self.generation_model.generate(
                     **inputs,
-                    max_new_tokens=100,
+                    max_new_tokens=max_tokens,
                     temperature=0.1,
                     do_sample=True,
                     pad_token_id=self.tokenizer.eos_token_id,

@@ -57,7 +57,7 @@ def install_requirements():
 def check_files():
     """Check required files exist"""
     required_files = [
-        "answer_template_small_part.md",
+        "answer_template.md",
         "question.csv", 
         "true_result.md",
         "main.py",

@@ -77,6 +77,14 @@ def run_evaluation(args):
     if args.top_k:
         config.TOP_K = args.top_k
     
+    # Set performance mode
+    if args.quick:
+        config.TOP_K = 1
+        config.QUICK_MODE = True
+    elif args.accurate:
+        config.TOP_K = 5
+        config.ACCURATE_MODE = True
+    
     # Check files
     if not check_files_exist(config):
         return 1
@@ -96,7 +104,10 @@ def run_evaluation(args):
             questions_file=config.QUESTIONS_PATH,
             ground_truth_file=config.TRUE_RESULTS_PATH,
             output_file=args.output,
-            max_workers=args.workers
+            max_workers=args.workers,
+            limit=args.limit,
+            random_sampling=args.random,
+            range_spec=args.range
         )
         
         end_time = datetime.now()
@@ -230,7 +241,7 @@ Examples:
     # Evaluate command
     eval_parser = subparsers.add_parser('evaluate', help='Run complete evaluation')
     eval_parser.add_argument('--document', '-d', 
-                           default='answer_template_small_part.md',
+                           default='answer_template.md',
                            help='Path to document file')
     eval_parser.add_argument('--questions', '-q',
                            default='question.csv', 
@@ -249,10 +260,24 @@ Examples:
     eval_parser.add_argument('--workers', type=int, default=1,
                            help='Number of parallel workers for processing')
     
+    # Limited testing options
+    eval_parser.add_argument('--limit', type=int,
+                           help='Test only first N questions')
+    eval_parser.add_argument('--random', action='store_true',
+                           help='Use random sampling instead of first N questions')
+    eval_parser.add_argument('--range', type=str,
+                           help='Test specific range (e.g., "100-200")')
+    
+    # Performance modes
+    eval_parser.add_argument('--quick', action='store_true',
+                           help='Quick mode: faster but less accurate')
+    eval_parser.add_argument('--accurate', action='store_true',
+                           help='Accurate mode: slower but more accurate')
+    
     # Test command
     test_parser = subparsers.add_parser('test', help='Test with single question')
     test_parser.add_argument('--document', '-d',
-                           default='answer_template_small_part.md', 
+                           default='answer_template.md', 
                            help='Path to document file')
     
     args = parser.parse_args()

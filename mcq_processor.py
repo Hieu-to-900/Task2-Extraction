@@ -19,8 +19,9 @@ class MCQProcessor:
         self.logger = rag_system.logger
         self.config = rag_system.config
         
-    def load_questions(self, file_path: str) -> pd.DataFrame:
-        """Load questions from CSV file"""
+    def load_questions(self, file_path: str, limit: int = None, 
+                     random_sampling: bool = False, range_spec: str = None) -> pd.DataFrame:
+        """Load questions from CSV file with sampling options"""
         self.logger.log_info(f"Loading questions from: {file_path}")
         
         try:
@@ -32,7 +33,26 @@ class MCQProcessor:
             if not all(col in df.columns for col in expected_columns):
                 raise ValueError(f"CSV must have columns: {expected_columns}")
             
-            self.logger.log_info(f"Loaded {len(df)} questions")
+            total_questions = len(df)
+            self.logger.log_info(f"Total questions available: {total_questions}")
+            
+            # Apply range filter if specified
+            if range_spec:
+                start, end = map(int, range_spec.split('-'))
+                df = df.iloc[start-1:end]  # Convert to 0-based indexing
+                self.logger.log_info(f"Using range {start}-{end}: {len(df)} questions")
+            
+            # Apply limit and sampling
+            if limit and limit < len(df):
+                if random_sampling:
+                    import random
+                    df = df.sample(n=limit, random_state=42)
+                    self.logger.log_info(f"Random sampling: {limit} questions")
+                else:
+                    df = df.head(limit)
+                    self.logger.log_info(f"Sequential sampling: first {limit} questions")
+            
+            self.logger.log_info(f"Final dataset: {len(df)} questions")
             return df
             
         except Exception as e:
@@ -124,19 +144,36 @@ class MCQProcessor:
         
         # Process questions (sequential for GPU optimization)
         self.logger.log_info("Processing questions sequentially for GPU optimization")
+        
+        start_time = time.time()
         for idx, row in questions_df.iterrows():
             result = self.process_single_question((idx, row))
             results.append(result)
             
-            # Progress logging
-            if (idx + 1) % 5 == 0:
-                self.logger.log_info(f"Processed {idx + 1}/{len(questions_df)} questions")
+            # Progress logging with ETA
+            completed = len(results)
+            total = len(questions_df)
+            progress_pct = (completed / total) * 100
+            
+            if completed % max(1, total // 20) == 0:  # Log every 5%
+                elapsed_time = time.time() - start_time
+                avg_time_per_question = elapsed_time / completed
+                remaining_questions = total - completed
+                eta_seconds = remaining_questions * avg_time_per_question
+                eta_minutes = eta_seconds / 60
+                
+                self.logger.log_info(
+                    f"Progress: {completed}/{total} ({progress_pct:.1f}%) | "
+                    f"Speed: {avg_time_per_question:.2f}s/question | "
+                    f"ETA: {eta_minutes:.1f} minutes"
+                )
                 
                 # Log GPU memory usage if available
                 if use_gpu:
                     memory_allocated = torch.cuda.memory_allocated() / 1024**3
                     memory_reserved = torch.cuda.memory_reserved() / 1024**3
-                    self.logger.log_info(f"GPU Memory - Allocated: {memory_allocated:.2f}GB, Reserved: {memory_reserved:.2f}GB")
+                    gpu_utilization = f"GPU Memory: {memory_allocated:.2f}GB allocated, {memory_reserved:.2f}GB reserved"
+                    self.logger.log_info(gpu_utilization)
         
         # Sort results by question index
         results.sort(key=lambda x: x[0])
@@ -260,7 +297,10 @@ class MCQProcessor:
     def run_complete_evaluation(self, questions_file: str = None, 
                               ground_truth_file: str = None,
                               output_file: str = "predictions.csv",
-                              max_workers: int = 1) -> Dict:
+                              max_workers: int = 1,
+                              limit: int = None,
+                              random_sampling: bool = False,
+                              range_spec: str = None) -> Dict:
         """Run complete evaluation pipeline with GPU optimization"""
         
         # Use default file paths if not provided
@@ -279,9 +319,27 @@ class MCQProcessor:
             self.logger.log_info("Running on CPU")
         
         try:
-            # Load data
-            questions_df = self.load_questions(questions_file)
+            # Load data with sampling options
+            questions_df = self.load_questions(
+                questions_file, 
+                limit=limit, 
+                random_sampling=random_sampling, 
+                range_spec=range_spec
+            )
             ground_truth = self.load_ground_truth(ground_truth_file)
+            
+            # Adjust ground truth to match selected questions
+            if limit or range_spec:
+                if range_spec:
+                    start, end = map(int, range_spec.split('-'))
+                    ground_truth = ground_truth[start-1:end]
+                elif limit:
+                    if random_sampling:
+                        # For random sampling, we need to match the selected indices
+                        selected_indices = questions_df.index.tolist()
+                        ground_truth = [ground_truth[i] for i in selected_indices if i < len(ground_truth)]
+                    else:
+                        ground_truth = ground_truth[:limit]
             
             # Process questions with GPU optimization
             start_time = time.time()

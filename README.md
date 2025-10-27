@@ -85,6 +85,7 @@ python main.py test
 
 ```bash
 python main.py evaluate --workers 4
+python main.py evaluate --limit 200 --workers 8 --top-k 4
 ```
 
 ## Output Files
