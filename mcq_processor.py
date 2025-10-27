@@ -183,30 +183,33 @@ class MCQProcessor:
     
     def calculate_score(self, predicted: List[str], actual: List[str]) -> float:
         """
-        Calculate score based on the specified criteria:
-        - 100% (1.0): No errors (exact match)
-        - 50% (0.5): Missing 1 correct answer
-        - 0% (0.0): Missing 2+ correct answers OR any wrong selection
+        Calculate score based on new error-based criteria:
+        N = 4 (total choices), k = number of correct answers, 
+        c = number of correct answers selected by AI,
+        w = number of wrong answers selected by AI,
+        e = errors = (k - c) + w
+        
+        Score: Pmax=1.0 if e=0, 0.5*Pmax if e=1, 0 if e>=2
         """
         
         predicted_set = set(predicted)
         actual_set = set(actual)
         
-        # Check for wrong selections (selected answers not in actual)
-        wrong_selections = predicted_set - actual_set
-        if wrong_selections:
-            return 0.0  # Any wrong selection = 0 points
+        # Calculate parameters
+        k = len(actual_set)  # number of correct answers (ground truth)
+        c = len(predicted_set & actual_set)  # number of correct answers selected by AI
+        w = len(predicted_set - actual_set)  # number of wrong answers selected by AI
         
-        # Check for missing correct answers
-        missing_answers = actual_set - predicted_set
-        num_missing = len(missing_answers)
+        # Calculate errors
+        e = (k - c) + w
         
-        if num_missing == 0:
-            return 1.0  # Perfect match
-        elif num_missing == 1:
-            return 0.5  # Missing 1 correct answer
+        # Apply scoring rules
+        if e == 0:
+            return 1.0  # Perfect - no errors
+        elif e == 1:
+            return 0.5  # One error
         else:
-            return 0.0  # Missing 2+ correct answers
+            return 0.0  # Two or more errors
     
     def evaluate_results(self, predictions: List[Tuple[int, List[str], float]], 
                         ground_truth: List[Tuple[int, List[str]]]) -> Dict:
