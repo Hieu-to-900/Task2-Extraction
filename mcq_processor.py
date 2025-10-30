@@ -11,6 +11,162 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from rag_system import VietnameseMCQRAG, RAGConfig, Logger
 
 
+class DebugSession:
+    """Handle interactive debugging session for multiple questions"""
+    
+    def __init__(self, rag_system: VietnameseMCQRAG):
+        self.rag_system = rag_system
+        self.logger = rag_system.logger
+        self.config = rag_system.config
+        self.questions_df = None
+        self.ground_truth = None
+        self.total_questions = 0
+        
+    def initialize(self):
+        """Initialize debug session by loading data once"""
+        try:
+            # Load questions and ground truth once
+            self.questions_df = self._load_questions(self.config.QUESTIONS_PATH)
+            self.ground_truth = self._load_ground_truth(self.config.TRUE_RESULTS_PATH)
+            self.total_questions = len(self.questions_df)
+            
+            print(f"✅ Debug session initialized. Available questions: 1-{self.total_questions}")
+            return True
+            
+        except Exception as e:
+            print(f"❌ Failed to initialize debug session: {str(e)}")
+            return False
+    
+    def _load_questions(self, file_path: str):
+        """Load questions from CSV file"""
+        import pandas as pd
+        
+        df = pd.read_csv(file_path, encoding='utf-8')
+        expected_columns = ['Question', 'A', 'B', 'C', 'D']
+        if not all(col in df.columns for col in expected_columns):
+            raise ValueError(f"CSV must have columns: {expected_columns}")
+        return df
+    
+    def _load_ground_truth(self, file_path: str):
+        """Load ground truth results"""
+        results = []
+        with open(file_path, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+            
+        for line in lines[1:]:  # Skip header
+            line = line.strip()
+            if not line:
+                continue
+                
+            if ',' in line:
+                parts = line.split(',', 1)
+                num_correct = int(parts[0])
+                answers_str = parts[1].strip('"')
+                
+                if answers_str:
+                    answers = [a.strip() for a in answers_str.split(',')]
+                else:
+                    answers = []
+                
+                results.append((num_correct, answers))
+        
+        return results
+    
+    def is_valid_question_id(self, question_id):
+        """Check if question ID is valid"""
+        return 1 <= question_id <= self.total_questions
+    
+    def debug_question(self, question_id: int):
+        """Debug a specific question"""
+        if not self.is_valid_question_id(question_id):
+            print(f"❌ Invalid question ID: {question_id}. Must be between 1 and {self.total_questions}")
+            return False
+        
+        try:
+            # Get question data (convert to 0-based index)
+            question_idx = question_id - 1
+            row = self.questions_df.iloc[question_idx]
+            
+            # Extract question and options
+            question = row['Question']
+            options = {
+                'A': row['A'],
+                'B': row['B'], 
+                'C': row['C'],
+                'D': row['D']
+            }
+            
+            # Get ground truth for this question
+            if question_idx < len(self.ground_truth):
+                actual_num, actual_answers = self.ground_truth[question_idx]
+            else:
+                actual_answers = []
+            
+            # Clear screen separator
+            print("\n" + "🔍" + "="*79)
+            print("1. INPUT ANALYSIS")
+            print("="*80)
+            print(f"Question ID: {question_id}")
+            print(f"Question: {question}")
+            print("Options:")
+            for key, value in options.items():
+                print(f"  {key}: {value}")
+            
+            # Get debug info from RAG system
+            debug_info = self.rag_system.answer_mcq_debug(question, options)
+            
+            print("\n" + "="*80)
+            print("2. RETRIEVED CONTEXT\n")
+            #print("="*80)
+            print(f"Top {len(debug_info['retrieved_chunks'])} chunks retrieved:")
+            for i, (chunk, score) in enumerate(debug_info['retrieved_chunks'], 1):
+                print(f"[Score: {score:.3f}] | [Chunk {i}]: {chunk}")
+                print()
+            
+            print("\n" + "="*80)
+            print("3. RAW MODEL RESPONSE\n")
+            #print("="*80)
+            print(debug_info['raw_response'])
+            
+            print("\n" + "="*80)
+            print("4. RESULT ANALYSIS")
+            # print("="*80)
+            predicted_answers = debug_info['parsed_answers']
+            
+            print(f"\nExpected Answer: {actual_answers}")
+            print(f"Predicted Answer: {predicted_answers}")
+            
+            # Calculate detailed scoring
+            if actual_answers:
+                predicted_set = set(predicted_answers)
+                actual_set = set(actual_answers)
+                
+                k = len(actual_set)  # number of correct answers
+                c = len(predicted_set & actual_set)  # correct answers selected
+                w = len(predicted_set - actual_set)  # wrong answers selected
+                e = (k - c) + w  # total errors
+                
+                # Calculate score
+                if e == 0:
+                    score = 1.0
+                    status = "✅ CORRECT"
+                elif e == 1:
+                    score = 0.5
+                    status = "⚠️ PARTIAL"
+                else:
+                    score = 0.0
+                    status = "❌ WRONG"
+                
+                print(f"Match Status: {status}")
+                print(f"Score: {score}")
+                       
+            return True
+            
+        except Exception as e:
+            print(f"❌ Debug failed for question {question_id}: {str(e)}")
+            return False
+
+
 class MCQProcessor:
     """Process MCQ questions in batches and evaluate results"""
     
@@ -210,6 +366,121 @@ class MCQProcessor:
             return 0.5  # One error
         else:
             return 0.0  # Two or more errors
+    
+    def debug_single_question(self, question_id: int):
+        """Debug a single question with detailed output"""
+        
+        try:
+            # Load questions and ground truth
+            questions_df = self.load_questions(self.config.QUESTIONS_PATH)
+            ground_truth = self.load_ground_truth(self.config.TRUE_RESULTS_PATH)
+            
+            # Validate question ID
+            if question_id < 1 or question_id > len(questions_df):
+                print(f"❌ Invalid question ID: {question_id}. Must be between 1 and {len(questions_df)}")
+                return
+            
+            # Get question data (convert to 0-based index)
+            question_idx = question_id - 1
+            row = questions_df.iloc[question_idx]
+            
+            # Extract question and options
+            question = row['Question']
+            options = {
+                'A': row['A'],
+                'B': row['B'], 
+                'C': row['C'],
+                'D': row['D']
+            }
+            
+            # Get ground truth for this question
+            if question_idx < len(ground_truth):
+                actual_num, actual_answers = ground_truth[question_idx]
+            else:
+                actual_answers = []
+            
+            print("\n" + "="*80)
+            print("1. INPUT ANALYSIS")
+            print("="*80)
+            print(f"Question ID: {question_id}")
+            print(f"Question: {question}")
+            print("Options:")
+            for key, value in options.items():
+                print(f"  {key}: {value}")
+            
+            # Get debug info from RAG system
+            debug_info = self.rag_system.answer_mcq_debug(question, options)
+            
+            print("\n" + "="*80)
+            print("2. RETRIEVED CONTEXT")
+            print("="*80)
+            print(f"Top {len(debug_info['retrieved_chunks'])} chunks retrieved:")
+            for i, (chunk, score) in enumerate(debug_info['retrieved_chunks'], 1):
+                print(f"[Score: {score:.3f}] Chunk {i}: {chunk[:100]}...")
+                if len(chunk) > 100:
+                    print(f"                    ...{chunk[-50:]}")
+                print()
+            
+            print("\n" + "="*80)
+            print("3. RAW MODEL RESPONSE")
+            print("="*80)
+            print(debug_info['raw_response'])
+            
+            print("\n" + "="*80)
+            print("4. RESULT ANALYSIS")
+            print("="*80)
+            predicted_answers = debug_info['parsed_answers']
+            print(f"Extracted Answer: {predicted_answers}")
+            print(f"Parsing Success: {'✅' if predicted_answers else '❌'}")
+            
+            print(f"\nExpected Answer: {actual_answers}")
+            print(f"Predicted Answer: {predicted_answers}")
+            
+            # Calculate detailed scoring
+            if actual_answers:
+                predicted_set = set(predicted_answers)
+                actual_set = set(actual_answers)
+                
+                k = len(actual_set)  # number of correct answers
+                c = len(predicted_set & actual_set)  # correct answers selected
+                w = len(predicted_set - actual_set)  # wrong answers selected
+                e = (k - c) + w  # total errors
+                
+                # Calculate score
+                if e == 0:
+                    score = 1.0
+                    status = "✅ CORRECT"
+                elif e == 1:
+                    score = 0.5
+                    status = "⚠️ PARTIAL"
+                else:
+                    score = 0.0
+                    status = "❌ WRONG"
+                
+                print(f"Match Status: {status}")
+                print(f"Score: {score}")
+                
+                print(f"\nScoring Breakdown:")
+                print(f"- k (correct answers): {k}")
+                print(f"- c (correct selected): {c}")
+                print(f"- w (wrong selected): {w}")
+                print(f"- e (total errors): {e}")
+                
+                # Context quality assessment
+                if debug_info['retrieved_chunks']:
+                    avg_score = sum(score for _, score in debug_info['retrieved_chunks']) / len(debug_info['retrieved_chunks'])
+                    context_quality = "GOOD" if avg_score > 0.8 else "FAIR" if avg_score > 0.6 else "POOR"
+                    print(f"\nContext Quality: {context_quality} (avg score: {avg_score:.3f})")
+                
+                # Confidence assessment
+                confidence = "HIGH" if (predicted_answers and len(predicted_answers) == 1) else "LOW"
+                print(f"Confidence Level: {confidence}")
+            
+            print("\n" + "="*80)
+            
+        except Exception as e:
+            self.logger.log_error(f"Error in debug mode: {str(e)}")
+            print(f"❌ Debug failed: {str(e)}")
     
     def evaluate_results(self, predictions: List[Tuple[int, List[str], float]], 
                         ground_truth: List[Tuple[int, List[str]]]) -> Dict:

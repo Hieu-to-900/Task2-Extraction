@@ -10,7 +10,7 @@ import json
 from datetime import datetime
 
 from rag_system import VietnameseMCQRAG, RAGConfig
-from mcq_processor import MCQProcessor
+from mcq_processor import MCQProcessor, DebugSession
 
 
 def print_banner():
@@ -56,6 +56,78 @@ def print_system_info():
     print(f"   Top-K Retrieval: {RAGConfig.TOP_K}")
     print(f"   Chunk Size: {RAGConfig.CHUNK_SIZE}")
     print()
+
+
+def run_debug(args):
+    """Run interactive debug mode for multiple questions"""
+    
+    print_banner()
+    print("🐛 INTERACTIVE DEBUG MODE")
+    print("="*60)
+    
+    config = RAGConfig()
+    
+    # Override config with command line arguments
+    if args.document:
+        config.DOCUMENT_PATH = args.document
+    if args.questions:
+        config.QUESTIONS_PATH = args.questions
+    if args.ground_truth:
+        config.TRUE_RESULTS_PATH = args.ground_truth
+    
+    try:
+        print("🚀 Initializing RAG system...")
+        rag_system = VietnameseMCQRAG(config)
+        rag_system.initialize()
+        
+        print("🔄 Creating debug session...")
+        debug_session = DebugSession(rag_system)
+        
+        if not debug_session.initialize():
+            return 1
+        
+        # Debug first question from command line
+        current_question_id = args.question_id
+        print(f"\n🐛 Debugging question {current_question_id}...")
+        debug_session.debug_question(current_question_id)
+        
+        # Interactive loop for additional questions
+        while True:
+            print("\n" + "🔄" + "="*79)
+            print("Enter next question ID to debug (or 'q'/'quit' to exit):")
+            print(f"Valid range: 1-{debug_session.total_questions}")
+            
+            try:
+                user_input = input("Question ID: ").strip().lower()
+                
+                # Check for quit commands
+                if user_input in ['q', 'quit', 'exit']:
+                    print("👋 Exiting debug session. Goodbye!")
+                    break
+                
+                # Validate and convert to integer
+                try:
+                    question_id = int(user_input)
+                except ValueError:
+                    print(f"❌ Invalid input '{user_input}'. Please enter a number or 'q' to quit.")
+                    continue
+                
+                # Debug the question
+                print(f"\n🐛 Debugging question {question_id}...")
+                debug_session.debug_question(question_id)
+                
+            except KeyboardInterrupt:
+                print("\n\n👋 Debug session interrupted. Exiting...")
+                break
+            except EOFError:
+                print("\n\n👋 Input stream ended. Exiting...")
+                break
+        
+        return 0
+        
+    except Exception as e:
+        print(f"\n❌ Error during debug: {str(e)}")
+        return 1
 
 
 def run_evaluation(args):
@@ -229,7 +301,11 @@ Examples:
   python main.py evaluate --rebuild-index
 
   # Test single question interactively
-  python main.py test
+  python main.py test --rebuild-index
+
+  # Debug specific question
+  python main.py debug 3
+  # Then interactively debug more questions: 5, 10, q
 
   # Run with more parallel workers
   python main.py evaluate --workers 4
@@ -241,7 +317,6 @@ Examples:
     # Evaluate command
     eval_parser = subparsers.add_parser('evaluate', help='Run complete evaluation')
     eval_parser.add_argument('--document', '-d', 
-                           default='answer_template.md',
                            help='Path to document file')
     eval_parser.add_argument('--questions', '-q',
                            default='question.csv', 
@@ -277,8 +352,19 @@ Examples:
     # Test command
     test_parser = subparsers.add_parser('test', help='Test with single question')
     test_parser.add_argument('--document', '-d',
-                           default='answer_template.md', 
                            help='Path to document file')
+    
+    # Debug command
+    debug_parser = subparsers.add_parser('debug', help='Debug specific question interactively')
+    debug_parser.add_argument('question_id', type=int, help='Initial question ID to debug (1-based)')
+    debug_parser.add_argument('--document', '-d',
+                            help='Path to document file')
+    debug_parser.add_argument('--questions', '-q',
+                            default='question.csv',
+                            help='Path to questions CSV file')
+    debug_parser.add_argument('--ground-truth', '-g',
+                            default='true_result.md',
+                            help='Path to ground truth file')
     
     args = parser.parse_args()
     
@@ -290,6 +376,8 @@ Examples:
         return run_evaluation(args)
     elif args.command == 'test':
         return run_single_test(args)
+    elif args.command == 'debug':
+        return run_debug(args)
     else:
         parser.print_help()
         return 1
