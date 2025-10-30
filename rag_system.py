@@ -1,26 +1,12 @@
-"""
-Vietnamese MCQ RAG System
-Core RAG implementation with LlamaIndex, custom Qwen3 embedding, and Phi-3 generation
-Features:
-- Custom Qwen3 embedding with proper instruction formatting for queries
-- Hierarchical document chunking
-- GPU-optimized inference
-- Vietnamese language support
-"""
-
 import os
 import re
-import json
 import logging
-import pandas as pd
 from typing import List, Dict, Tuple, Optional, Union
 from datetime import datetime
 import torch
 import torch.nn.functional as F
 from torch import Tensor
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoModel
-from transformers.utils import is_flash_attn_2_available
-import numpy as np
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -35,8 +21,6 @@ from llama_index.core import (
 )
 from llama_index.core.node_parser import SentenceSplitter
 from llama_index.core.schema import BaseNode, TextNode
-from llama_index.core.prompts import PromptTemplate
-from llama_index.core.query_engine import RetrieverQueryEngine
 from llama_index.core.retrievers import VectorIndexRetriever
 from llama_index.core.base.embeddings.base import BaseEmbedding
 
@@ -45,17 +29,12 @@ class RAGConfig:
     """Configuration for RAG system"""
     # Model configurations
     EMBEDDING_MODEL = "Qwen/Qwen3-Embedding-0.6B"
-    GENERATION_MODEL = "microsoft/Phi-3-mini-4k-instruct"
+    GENERATION_MODEL = "Qwen/Qwen3-0.6B"
     
     # RAG parameters
     TOP_K = 2
-    CHUNK_SIZE = 200  # Let LlamaIndex optimize based on model
+    CHUNK_SIZE = 200
     CHUNK_OVERLAP = 50
-    
-    # Performance modes
-    QUICK_MODE = False
-    ACCURATE_MODE = False
-    MAX_NEW_TOKENS = 1500
     
     # File paths
     DOCUMENT_PATH = "documents"
@@ -91,19 +70,11 @@ class Qwen3EmbeddingLlamaIndex(BaseEmbedding):
         self.__dict__['qwen_device'] = "cuda:0" if use_cuda and torch.cuda.is_available() else "cpu"
         
         # Load model with optimizations
-        if is_flash_attn_2_available() and use_cuda:
-            qwen_model = AutoModel.from_pretrained(
-                model_name_or_path, 
-                trust_remote_code=True, 
-                attn_implementation="flash_attention_2", 
-                torch_dtype=torch.float16 if use_fp16 else torch.float32
-            )
-        else:
-            qwen_model = AutoModel.from_pretrained(
-                model_name_or_path, 
-                trust_remote_code=True, 
-                torch_dtype=torch.float16 if use_fp16 else torch.float32
-            )
+        qwen_model = AutoModel.from_pretrained(
+            model_name_or_path, 
+            trust_remote_code=True, 
+            torch_dtype=torch.float16 if use_fp16 else torch.float32
+        )
         
         # Move to device and store
         self.__dict__['qwen_model'] = qwen_model.to(self.__dict__['qwen_device'])
@@ -312,7 +283,7 @@ class VietnameseMCQRAG:
         return embed_model
     
     def setup_generation_model(self):
-        """Setup Phi-3 generation model with proper cache handling"""
+        """Setup Qwen3-0.6B generation model"""
         self.logger.log_info(f"Loading generation model: {self.config.GENERATION_MODEL}")
         
         try:
@@ -325,37 +296,26 @@ class VietnameseMCQRAG:
             else:
                 self.logger.log_info("Using CPU with FP32 precision")
             
-            # Load tokenizer with proper padding
+            # Load tokenizer
             self.tokenizer = AutoTokenizer.from_pretrained(
                 self.config.GENERATION_MODEL,
-                trust_remote_code=True,
-                padding_side='left'
+                trust_remote_code=True
             )
-            
-            # Set pad token if not exists
-            if self.tokenizer.pad_token is None:
-                self.tokenizer.pad_token = self.tokenizer.eos_token
             
             # Load model with optimizations
-            model_kwargs = {
-                "torch_dtype": torch_dtype,
-                "trust_remote_code": True
-            }
-            
             if torch.cuda.is_available():
-                model_kwargs.update({
-                    "device_map": "auto",  # Automatic device mapping
-                    "attn_implementation": "flash_attention_2" if is_flash_attn_2_available() else "eager"
-                })
-            
-            self.generation_model = AutoModelForCausalLM.from_pretrained(
-                self.config.GENERATION_MODEL,
-                **model_kwargs
-            )
-            
-            # Move to device if not using device_map
-            if not torch.cuda.is_available():
-                self.generation_model = self.generation_model.to(device)
+                self.generation_model = AutoModelForCausalLM.from_pretrained(
+                    self.config.GENERATION_MODEL,
+                    torch_dtype=torch_dtype,
+                    device_map="auto",
+                    trust_remote_code=True
+                )
+            else:
+                self.generation_model = AutoModelForCausalLM.from_pretrained(
+                    self.config.GENERATION_MODEL,
+                    torch_dtype=torch_dtype,
+                    trust_remote_code=True
+                ).to(device)
             
             # Set to eval mode
             self.generation_model.eval()
@@ -480,14 +440,17 @@ class VietnameseMCQRAG:
             self.logger.log_error("Failed to setup query engine", e)
             raise
     
-    def generate_answer_with_phi3(self, context: str, question: str, options: Dict[str, str]) -> str:
-        """Generate answer using Phi-3 model with fixed cache handling"""
+    def generate_answer_with_qwen3(self, context: str, question: str, options: Dict[str, str]) -> str:
+        """Generate answer using Qwen3-0.6B model with chat format"""
         
         # Format options
         options_text = ", ".join([f"{k}: {v}" for k, v in options.items()])
         
-        # Create prompt
-        prompt = f"""Bạn là một trợ lý AI chuyên trả lời câu hỏi trắc nghiệm tiếng Việt.
+        # Create messages in chat format for Qwen3
+        messages = [
+            {
+                "role": "user",
+                "content": f"""Bạn là một trợ lý AI chuyên trả lời câu hỏi trắc nghiệm tiếng Việt.
 
 Context thông tin:
 {context}
@@ -501,16 +464,19 @@ Hướng dẫn:
 3. Trả lời theo định dạng chính xác: "Đáp án đúng: [danh sách các đáp án]" (ví dụ: "Đáp án đúng: A, C")
 4. Nếu không tìm thấy thông tin trong context, trả lời: "Không có thông tin đủ để trả lời"
 """
+            }
+        ]
         
         try:
-            # Tokenize input
-            inputs = self.tokenizer(
-                prompt, 
-                return_tensors="pt", 
-                truncation=True, 
-                max_length=2000,  # Reduced to avoid token limits
-                padding=False  # Disable padding to avoid issues
+            # Apply chat template
+            text = self.tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True
             )
+            
+            # Tokenize input
+            inputs = self.tokenizer(text, return_tensors="pt")
             
             # Count tokens
             input_token_count = inputs['input_ids'].shape[1]
@@ -520,45 +486,24 @@ Hướng dẫn:
             device = next(self.generation_model.parameters()).device
             inputs = {k: v.to(device) for k, v in inputs.items()}
             
-            # Generation parameters - simplified to avoid cache issues
-            max_tokens = min(150, self.config.MAX_NEW_TOKENS)  # Conservative limit
-            
+            # Generate response
             with torch.no_grad():
-                # Simplified generation call to avoid DynamicCache issues
-                try:
-                    # Try with minimal parameters first
-                    outputs = self.generation_model.generate(
-                        inputs['input_ids'],
-                        max_new_tokens=max_tokens,
-                        temperature=0.1,
-                        do_sample=True,
-                        top_p=0.9,
-                        pad_token_id=self.tokenizer.pad_token_id,
-                        eos_token_id=self.tokenizer.eos_token_id,
-                        use_cache=False,  # Disable cache to avoid DynamicCache issues
-                        repetition_penalty=1.1
-                    )
-                except Exception as cache_error:
-                    # Fallback: try without sampling
-                    self.logger.log_info("Retrying with greedy decoding...")
-                    outputs = self.generation_model.generate(
-                        inputs['input_ids'],
-                        max_new_tokens=max_tokens,
-                        do_sample=False,  # Greedy decoding
-                        pad_token_id=self.tokenizer.pad_token_id,
-                        eos_token_id=self.tokenizer.eos_token_id,
-                        use_cache=False,
-                        repetition_penalty=1.1
-                    )
+                outputs = self.generation_model.generate(
+                    **inputs,
+                    max_new_tokens=32768,
+                    temperature=0.7,
+                    do_sample=True,
+                    #top_p=0.9,
+                    pad_token_id=self.tokenizer.eos_token_id
+                )
                 
-                # Decode only the new tokens (skip input)
+                # Decode only the new tokens
                 input_length = inputs['input_ids'].shape[1]
                 new_tokens = outputs[:, input_length:]
                 
                 response = self.tokenizer.decode(
                     new_tokens[0], 
-                    skip_special_tokens=True,
-                    clean_up_tokenization_spaces=True
+                    skip_special_tokens=True
                 )
 
             # Count output tokens
@@ -659,8 +604,8 @@ Hướng dẫn:
             
             context = "\n\n".join(context_parts)
             
-            # Generate answer using Phi-3 model
-            response = self.generate_answer_with_phi3(context, question, options)
+            # Generate answer using Qwen3 model
+            response = self.generate_answer_with_qwen3(context, question, options)
             
             # Parse answer
             answers = self.parse_answer(response)
@@ -692,8 +637,8 @@ Hướng dẫn:
             
             context = "\n\n".join(context_parts)
             
-            # Generate answer using Phi-3 model
-            raw_response = self.generate_answer_with_phi3(context, question, options)
+            # Generate answer using Qwen3 model
+            raw_response = self.generate_answer_with_qwen3(context, question, options)
             
             # Parse answer
             parsed_answers = self.parse_answer(raw_response)
@@ -760,7 +705,7 @@ if __name__ == "__main__":
     rag_system = VietnameseMCQRAG()
     rag_system.initialize(force_rebuild_index=False)
     
-    # Interactive loop for testing questions and retrieving relevant chunks
+    # 1. Interactive loop for testing questions and retrieving relevant chunks
     while True:
         print("\n" + "="*50)
         question = input("Enter your question (or 'quit' to exit): ").strip()
