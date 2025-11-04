@@ -15,7 +15,7 @@ def breakdown_markdown_file(input_file: str, output_dir: str = "documents"):
         content = f.read()
     
     # Split by # Public pattern
-    sections = re.split(r'\n(?=# Public\d+)', content)
+    sections = re.split(r'\n(?=# Public_\d+)', content)
     
     # Process each section
     files_created = 0
@@ -41,4 +41,4 @@ def breakdown_markdown_file(input_file: str, output_dir: str = "documents"):
 
 if __name__ == "__main__":
     # Usage
-    breakdown_markdown_file("answer_template_0to89.md", "documents")
+    breakdown_markdown_file("document-GD4.md", "documents")
