@@ -1,15 +1,13 @@
 # Core RAG framework
-llama-index==0.10.68
-llama-index-vector-stores-chroma==0.1.10
-# llama-index-embeddings-huggingface==0.2.3
+llama-index==0.14.7
+llama-index-vector-stores-elasticsearch>=0.1.0  # Thêm package này
+llama-index-retrievers-bm25>=0.1.0
 
-# Vector database
-# chromadb>=0.4.24
+# Elasticsearch client
+elasticsearch>=8.0.0
 
 # ML/AI libraries - GPU optimized for RTX 3090
-# torch>=2.0.0
 transformers>=4.51.0
-# sentence-transformers>=2.2.2
 
 # Data processing
 pandas>=2.1.0
@@ -21,5 +19,3 @@ python-dotenv>=1.0.0
 
 # GPU acceleration for RTX 3090
 accelerate>=0.24.0
-# flash-attn>=2.3.0  # Removed - compilation issues on Windows. Use below command
-# pip install https://huggingface.co/lldacing/flash-attention-windows-wheel/resolve/main/flash_attn-2.7.4.post1%2Bcu128torch2.8.0cxx11abiTRUE-cp310-cp310-win_amd64.whl?download=true

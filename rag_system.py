@@ -21,10 +21,13 @@ from llama_index.core import (
 )
 from llama_index.core.node_parser import SentenceSplitter
 from llama_index.core.schema import BaseNode, TextNode
-from llama_index.core.retrievers import VectorIndexRetriever
+from llama_index.core.retrievers import VectorIndexRetriever, BaseRetriever
 from llama_index.core.base.embeddings.base import BaseEmbedding
-
-
+# Elasticsearch integration
+from llama_index.vector_stores.elasticsearch import ElasticsearchStore
+from elasticsearch import Elasticsearch
+from llama_index.retrievers.bm25 import BM25Retriever
+111 
 class RAGConfig:
     """Configuration for RAG system"""
     # Model configurations
@@ -32,8 +35,8 @@ class RAGConfig:
     GENERATION_MODEL = "Qwen/Qwen3-0.6B"
     
     # RAG parameters
-    TOP_K = 2
-    CHUNK_SIZE = 200
+    TOP_K = 6
+    CHUNK_SIZE = 400
     CHUNK_OVERLAP = 50
     
     # File paths
@@ -41,9 +44,15 @@ class RAGConfig:
     QUESTIONS_PATH = "question.csv"
     TRUE_RESULTS_PATH = "true_result.md"
     
-    # Storage
-    INDEX_STORAGE_PATH = "./storage"
-
+    # Elasticsearch configuration
+    ELASTICSEARCH_URL = "http://localhost:9200"  # Hoặc Elastic Cloud URL
+    ELASTICSEARCH_INDEX = "vietnamese_mcq_rag"   # Index name
+    ELASTICSEARCH_USER = None  # Nếu có authentication
+    ELASTICSEARCH_PASSWORD = None  # Nếu có authentication
+    
+    # Hybrid retrieval parameters
+    HYBRID_ALPHA = 0.5  # 0.0 = chỉ keyword, 1.0 = chỉ vector, 0.5 = balanced
+    HYBRID_TOP_K = 10    # Số kết quả từ mỗi method trong hybrid search
 
 class Qwen3EmbeddingLlamaIndex(BaseEmbedding):
     """Custom Qwen3 Embedding class integrated with LlamaIndex"""
@@ -335,8 +344,8 @@ class VietnameseMCQRAG:
 
         # Step 2: Sentence-level splitting
         sentence_splitter = SentenceSplitter(
-            chunk_size=400,  # Smaller for MCQ context
-            chunk_overlap=50,
+            chunk_size=self.config.CHUNK_SIZE,  # Smaller for MCQ context
+            chunk_overlap=self.config.CHUNK_OVERLAP,
             paragraph_separator="\n\n",
             secondary_chunking_regex="[.!?。！？]"  # Vietnamese support
         )
@@ -387,54 +396,21 @@ class VietnameseMCQRAG:
             raise
     
     def create_vector_index(self, documents: List, force_rebuild: bool = False):
-        """Create or load vector index with native LlamaIndex storage"""
-        
-        try:
-            # Try to load existing index
-            if not force_rebuild and os.path.exists(self.config.INDEX_STORAGE_PATH):
-                self.logger.log_info("Loading existing vector index...")
-                storage_context = StorageContext.from_defaults(persist_dir=self.config.INDEX_STORAGE_PATH)
-                self.index = load_index_from_storage(storage_context)
-                self.logger.log_info("Vector index loaded successfully")
-                return
-        except Exception as e:
-            self.logger.log_info(f"Could not load existing index ({str(e)}), creating new one...")
-        
-        self.logger.log_info("Creating new vector index with hierarchical chunking...")
-        
-        # Setup optimal chunking
-        self.setup_chunking()
-
-        # Create index with automatic transformations
-        # Documents will be processed through MarkdownNodeParser -> SentenceSplitter pipeline
-        self.index = VectorStoreIndex.from_documents(
-            documents,
-            show_progress=True,
-            # transformations are applied automatically from Settings
-        )
-        
-        # Persist index to storage directory
-        self.index.storage_context.persist(persist_dir=self.config.INDEX_STORAGE_PATH)
-        self.logger.log_info("Vector index created and persisted successfully")
+        """Create or load vector index with Elasticsearch"""
+        self.create_elasticsearch_index(documents, force_rebuild)
     
     def setup_query_engine(self):
-        """Setup query engine - bypass LlamaIndex LLM, use retrieval only"""
-        self.logger.log_info("Setting up query engine with custom Qwen3 retriever...")
+        """Setup query engine with hybrid retrieval"""
+        self.logger.log_info("Setting up query engine with hybrid retrieval (Elasticsearch)...")
         
         try:
-            # Set global LLM to None to disable OpenAI and bypass LLM complexity
+            # Set global LLM to None
             Settings.llm = None
             
-            # Create retriever with custom Qwen3 embedding (instruction formatting handled automatically)
-            retriever = VectorIndexRetriever(
-                index=self.index,
-                similarity_top_k=self.config.TOP_K,
-            )
+            # Create hybrid retriever
+            self.retriever = self.create_hybrid_retriever()
             
-            # Store retriever for manual context extraction
-            self.retriever = retriever
-            
-            self.logger.log_info("Query engine setup completed - using custom Qwen3 embeddings")
+            self.logger.log_info("Hybrid query engine setup completed")
             
         except Exception as e:
             self.logger.log_error("Failed to setup query engine", e)
@@ -447,25 +423,22 @@ class VietnameseMCQRAG:
         options_text = ", ".join([f"{k}: {v}" for k, v in options.items()])
         
         # Create messages in chat format for Qwen3
-        messages = [
-            {
-                "role": "user",
-                "content": f"""Bạn là một trợ lý AI chuyên trả lời câu hỏi trắc nghiệm tiếng Việt.
+        messages = [{"role": "user",
+            "content": 
+                f"""Bạn là một trợ lý AI chuyên trả lời câu hỏi trắc nghiệm tiếng Việt.
+                    Context thông tin:
+                    {context}
 
-Context thông tin:
-{context}
+                    Câu hỏi: {question}
+                    Các lựa chọn: {options_text}
 
-Câu hỏi: {question}
-Các lựa chọn: {options_text}
-
-Hướng dẫn:
-1. Đọc kỹ context và câu hỏi
-2. Phân tích từng lựa chọn dựa trên thông tin trong context
-3. Trả lời theo định dạng chính xác: "Đáp án đúng: [danh sách các đáp án]" (ví dụ: "Đáp án đúng: A, C")
-4. Nếu không tìm thấy thông tin trong context, trả lời: "Không có thông tin đủ để trả lời"
-"""
-            }
-        ]
+                    Hướng dẫn:
+                    1. Đọc kỹ context và câu hỏi
+                    2. Phân tích từng lựa chọn dựa trên thông tin trong context
+                    3. Trả lời theo định dạng chính xác: "Đáp án đúng: [danh sách các đáp án]" (ví dụ: "Đáp án đúng: A, C")
+                    4. Nếu không tìm thấy thông tin trong context, trả lời: "Không có thông tin đủ để trả lời"
+                """
+            }]
         
         try:
             # Apply chat template
@@ -698,6 +671,238 @@ Hướng dẫn:
         self.setup_query_engine()
         
         self.logger.log_info("RAG system initialization completed successfully!")
+
+    def setup_elasticsearch_client(self):
+        """Setup Elasticsearch client connection"""
+        self.logger.log_info("Connecting to Elasticsearch...")
+        
+        try:
+            # Tạo Elasticsearch client
+            es_client_kwargs = {
+                "hosts": [self.config.ELASTICSEARCH_URL],
+            }
+            
+            # Add authentication nếu có
+            if self.config.ELASTICSEARCH_USER and self.config.ELASTICSEARCH_PASSWORD:
+                es_client_kwargs["basic_auth"] = (
+                    self.config.ELASTICSEARCH_USER,
+                    self.config.ELASTICSEARCH_PASSWORD
+                )
+            
+            es_client = Elasticsearch(**es_client_kwargs)
+            
+            # Test connection
+            if not es_client.ping():
+                raise ConnectionError("Cannot connect to Elasticsearch")
+            
+            self.logger.log_info(f"Connected to Elasticsearch: {self.config.ELASTICSEARCH_URL}")
+            return es_client
+            
+        except Exception as e:
+            self.logger.log_error("Failed to connect to Elasticsearch", e)
+            raise
+
+    def create_elasticsearch_index(self, documents: List, force_rebuild: bool = False):
+        """Create or load Elasticsearch index with hybrid retrieval support"""
+        
+        # Setup Elasticsearch client - đảm bảo luôn được khởi tạo
+        es_client = self.setup_elasticsearch_client()
+        
+        try:
+            # Kiểm tra index đã tồn tại chưa
+            index_exists = es_client.indices.exists(index=self.config.ELASTICSEARCH_INDEX)
+            
+            if index_exists and not force_rebuild:
+                self.logger.log_info(f"Loading existing Elasticsearch index: {self.config.ELASTICSEARCH_INDEX}")
+                
+                # Tạo ElasticsearchStore từ existing index
+                vector_store = ElasticsearchStore(
+                    index_name=self.config.ELASTICSEARCH_INDEX,
+                    es_client=es_client,
+                )
+                
+                # Load index từ vector store
+                self.index = VectorStoreIndex.from_vector_store(
+                    vector_store=vector_store,
+                    embed_model=Settings.embed_model
+                )
+                
+                self.logger.log_info("Elasticsearch index loaded successfully")
+                return
+                
+            elif index_exists and force_rebuild:
+                self.logger.log_info(f"Deleting existing index: {self.config.ELASTICSEARCH_INDEX}")
+                es_client.indices.delete(index=self.config.ELASTICSEARCH_INDEX)
+            
+        except Exception as e:
+            self.logger.log_info(f"Could not load existing index ({str(e)}), creating new one...")
+        
+        self.logger.log_info("Creating new Elasticsearch index with hybrid retrieval support...")
+        
+        # Setup optimal chunking
+        self.setup_chunking()
+        
+        # Tạo ElasticsearchStore với custom mapping để hỗ trợ hybrid search
+        vector_store = ElasticsearchStore(
+            index_name=self.config.ELASTICSEARCH_INDEX,
+            es_client=es_client,  # Đảm bảo es_client đã được khởi tạo
+            # Elasticsearch sẽ tự động lưu cả text và vector
+            # text_field: lưu text content
+            # vector_field: lưu embedding vector
+        )
+        
+        # Create index từ documents
+        # Documents sẽ được chunked và embedded tự động
+        self.index = VectorStoreIndex.from_documents(
+            documents,
+            vector_store=vector_store,
+            show_progress=True,
+            # transformations are applied automatically from Settings
+        )
+        
+        self.logger.log_info("Elasticsearch index created successfully with hybrid retrieval support")
+
+    def create_hybrid_retriever(self):
+        """Create hybrid retriever combining vector search and keyword search"""
+        
+        # Vector retriever (semantic search)
+        vector_retriever = VectorIndexRetriever(
+            index=self.index,
+            similarity_top_k=self.config.HYBRID_TOP_K,
+        )
+        
+        # BM25 retriever (keyword search) - lấy nodes từ index
+        nodes = []
+        try:
+            # Với Elasticsearch, cần lấy nodes từ docstore hoặc từ Elasticsearch
+            if hasattr(self.index, 'storage_context') and hasattr(self.index.storage_context, 'docstore'):
+                for node_id in self.index.storage_context.docstore.docs:
+                    node = self.index.storage_context.docstore.get_node(node_id)
+                    if node:
+                        nodes.append(node)
+            else:
+                # Fallback: nếu không có docstore, chỉ dùng vector retriever
+                self.logger.log_info("No docstore available, using vector retriever only")
+                return vector_retriever
+        except Exception as e:
+            self.logger.log_error(f"Error getting nodes for BM25: {str(e)}")
+            # Fallback: nếu lỗi, chỉ dùng vector retriever
+            return vector_retriever
+        
+        if not nodes:
+            self.logger.log_info("No nodes found, using vector retriever only")
+            return vector_retriever
+        
+        # Tạo BM25 retriever từ nodes
+        bm25_retriever = BM25Retriever.from_defaults(
+            nodes=nodes,
+            similarity_top_k=self.config.HYBRID_TOP_K,
+        )
+        
+        # Tạo hybrid retriever với weighted combination
+        class HybridRetriever(BaseRetriever):
+            def __init__(self, vector_retriever, bm25_retriever, alpha=0.5, top_k=10):
+                super().__init__()
+                self.vector_retriever = vector_retriever
+                self.bm25_retriever = bm25_retriever
+                self.alpha = alpha  # 0.5 = balanced, 0.0 = only keyword, 1.0 = only vector
+                self.top_k = top_k  # Truyền top_k vào
+            
+            def _retrieve(self, query_bundle):
+                # Retrieve từ cả 2 methods
+                vector_nodes = self.vector_retriever.retrieve(query_bundle)
+                keyword_nodes = self.bm25_retriever.retrieve(query_bundle)
+                
+                # Combine results với weighted scoring
+                combined_nodes = {}
+                
+                # Add vector results
+                for node in vector_nodes:
+                    node_id = node.node_id
+                    score = getattr(node, 'score', 0.0)
+                    combined_nodes[node_id] = {
+                        'node': node,
+                        'vector_score': score * self.alpha,
+                        'keyword_score': 0.0
+                    }
+                
+                # Add keyword results
+                for node in keyword_nodes:
+                    node_id = node.node_id
+                    score = getattr(node, 'score', 0.0)
+                    if node_id in combined_nodes:
+                        combined_nodes[node_id]['keyword_score'] = score * (1 - self.alpha)
+                    else:
+                        combined_nodes[node_id] = {
+                            'node': node,
+                            'vector_score': 0.0,
+                            'keyword_score': score * (1 - self.alpha)
+                        }
+                
+                # Calculate combined scores
+                for node_id, data in combined_nodes.items():
+                    combined_score = data['vector_score'] + data['keyword_score']
+                    data['node'].score = combined_score
+                
+                # Sort by combined score và return top K
+                sorted_nodes = sorted(
+                    combined_nodes.values(),
+                    key=lambda x: x['vector_score'] + x['keyword_score'],
+                    reverse=True
+                )
+                
+                # Return top K nodes
+                return [item['node'] for item in sorted_nodes[:self.top_k]]
+        
+        hybrid_retriever = HybridRetriever(
+            vector_retriever=vector_retriever,
+            bm25_retriever=bm25_retriever,
+            alpha=self.config.HYBRID_ALPHA,
+            top_k=self.config.TOP_K  # Truyền top_k vào
+        )
+        
+        return hybrid_retriever
+
+
+    def create_elasticsearch_mapping(self, es_client):
+        """Create Elasticsearch index mapping for hybrid retrieval (optional - not used by default)"""
+        
+        mapping = {
+            "mappings": {
+                "properties": {
+                    "text": {
+                        "type": "text",
+                        "analyzer": "standard",  # Hoặc "vi_analyzer" nếu có Vietnamese analyzer
+                        "fields": {
+                            "keyword": {
+                                "type": "keyword"
+                            }
+                        }
+                    },
+                    "embedding": {
+                        "type": "dense_vector",
+                        "dims": 1024,  # Dimension của Qwen3-Embedding-0.6B (cần check actual dimension)
+                        "index": True,
+                        "similarity": "cosine"
+                    },
+                    "metadata": {
+                        "type": "object",
+                        "enabled": True
+                    }
+                }
+            }
+        }
+        
+        try:
+            es_client.indices.create(
+                index=self.config.ELASTICSEARCH_INDEX,
+                body=mapping
+            )
+            self.logger.log_info("Custom Elasticsearch mapping created successfully")
+        except Exception as e:
+            self.logger.log_error(f"Failed to create custom mapping: {str(e)}")
+            # ElasticsearchStore sẽ tự tạo mapping nếu không có
+
 
 
 if __name__ == "__main__":
