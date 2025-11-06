@@ -319,10 +319,8 @@ Examples:
     eval_parser.add_argument('--document', '-d', 
                            help='Path to document file')
     eval_parser.add_argument('--questions', '-q',
-                           default='question.csv', 
                            help='Path to questions CSV file')
     eval_parser.add_argument('--ground-truth', '-g',
-                           default='true_result.md',
                            help='Path to ground truth file')
     eval_parser.add_argument('--output', '-o',
                            default='predictions.csv',
@@ -360,10 +358,8 @@ Examples:
     debug_parser.add_argument('--document', '-d',
                             help='Path to document file')
     debug_parser.add_argument('--questions', '-q',
-                            default='question.csv',
                             help='Path to questions CSV file')
     debug_parser.add_argument('--ground-truth', '-g',
-                            default='true_result.md',
                             help='Path to ground truth file')
     
     args = parser.parse_args()

@@ -116,7 +116,15 @@ class DebugSession:
             debug_info = self.rag_system.answer_mcq_debug(question, options)
             
             print("\n" + "="*80)
-            print("2. RETRIEVED CONTEXT\n")
+            print("2. QUERY REFORMULATION")
+            print("="*80)
+            original_query = debug_info.get('original_query', question)
+            reformulated_query = debug_info.get('reformulated_query', question)
+            print(f"Original Query: {original_query}")
+            print(f"Reformulated Query: {reformulated_query}")
+            
+            print("\n" + "="*80)
+            print("3. RETRIEVED CONTEXT\n")
             #print("="*80)
             print(f"Top {len(debug_info['retrieved_chunks'])} chunks retrieved:")
             for i, (chunk, score) in enumerate(debug_info['retrieved_chunks'], 1):
@@ -124,12 +132,12 @@ class DebugSession:
                 print()
             
             print("\n" + "="*80)
-            print("3. RAW MODEL RESPONSE\n")
+            print("4. RAW MODEL RESPONSE\n")
             #print("="*80)
             print(debug_info['raw_response'])
             
             print("\n" + "="*80)
-            print("4. RESULT ANALYSIS")
+            print("5. RESULT ANALYSIS")
             # print("="*80)
             predicted_answers = debug_info['parsed_answers']
             
@@ -412,7 +420,15 @@ class MCQProcessor:
             debug_info = self.rag_system.answer_mcq_debug(question, options)
             
             print("\n" + "="*80)
-            print("2. RETRIEVED CONTEXT")
+            print("2. QUERY REFORMULATION")
+            print("="*80)
+            original_query = debug_info.get('original_query', question)
+            reformulated_query = debug_info.get('reformulated_query', question)
+            print(f"Original Query: {original_query}")
+            print(f"Reformulated Query: {reformulated_query}")
+            
+            print("\n" + "="*80)
+            print("3. RETRIEVED CONTEXT")
             print("="*80)
             print(f"Top {len(debug_info['retrieved_chunks'])} chunks retrieved:")
             for i, (chunk, score) in enumerate(debug_info['retrieved_chunks'], 1):
@@ -422,12 +438,12 @@ class MCQProcessor:
                 print()
             
             print("\n" + "="*80)
-            print("3. RAW MODEL RESPONSE")
+            print("4. RAW MODEL RESPONSE")
             print("="*80)
             print(debug_info['raw_response'])
             
             print("\n" + "="*80)
-            print("4. RESULT ANALYSIS")
+            print("5. RESULT ANALYSIS")
             print("="*80)
             predicted_answers = debug_info['parsed_answers']
             print(f"Extracted Answer: {predicted_answers}")

@@ -15,19 +15,15 @@ from llama_index.core import (
     VectorStoreIndex, 
     SimpleDirectoryReader, 
     Settings,
-    StorageContext,
-    load_index_from_storage,
     Document
 )
 from llama_index.core.node_parser import SentenceSplitter
-from llama_index.core.schema import BaseNode, TextNode
 from llama_index.core.retrievers import VectorIndexRetriever, BaseRetriever
 from llama_index.core.base.embeddings.base import BaseEmbedding
-# Elasticsearch integration
 from llama_index.vector_stores.elasticsearch import ElasticsearchStore
 from elasticsearch import Elasticsearch
 from llama_index.retrievers.bm25 import BM25Retriever
-111 
+
 class RAGConfig:
     """Configuration for RAG system"""
     # Model configurations
@@ -41,8 +37,8 @@ class RAGConfig:
     
     # File paths
     DOCUMENT_PATH = "documents"
-    QUESTIONS_PATH = "question.csv"
-    TRUE_RESULTS_PATH = "true_result.md"
+    QUESTIONS_PATH = "Question-Bank-GD4.csv"
+    TRUE_RESULTS_PATH = "Answer-for-question-bank-gd4.md"
     
     # Elasticsearch configuration
     ELASTICSEARCH_URL = "http://localhost:9200"  # Hoặc Elastic Cloud URL
@@ -53,6 +49,11 @@ class RAGConfig:
     # Hybrid retrieval parameters
     HYBRID_ALPHA = 0.5  # 0.0 = chỉ keyword, 1.0 = chỉ vector, 0.5 = balanced
     HYBRID_TOP_K = 10    # Số kết quả từ mỗi method trong hybrid search
+    
+    # Query reformulation parameters
+    REFORMULATION_ENABLED = True  # Enable/disable query reformulation
+    REFORMULATION_TEMPERATURE = 0.7  # Temperature for reformulation generation
+    REFORMULATION_MAX_TOKENS = 1024  # Maximum tokens for reformulated query
 
 class Qwen3EmbeddingLlamaIndex(BaseEmbedding):
     """Custom Qwen3 Embedding class integrated with LlamaIndex"""
@@ -272,7 +273,7 @@ class VietnameseMCQRAG:
             self.logger.log_info(f"GPU detected: {gpu_name} ({gpu_memory:.1f}GB)")
         
         # Vietnamese-optimized instruction
-        vietnamese_instruction = 'Tìm kiếm đoạn văn bản tiếng Việt có chứa thông tin trả lời câu hỏi'
+        vietnamese_instruction = 'Given a web search query, retrieve relevant passages that answer the query'
         # Setup custom Qwen3 embedding model
         embed_model = Qwen3EmbeddingLlamaIndex(
             model_name_or_path=self.config.EMBEDDING_MODEL,
@@ -494,6 +495,93 @@ class VietnameseMCQRAG:
             # Provide a simple fallback
             return "Tôi không thể xử lý câu hỏi này do lỗi kỹ thuật."
     
+    def reformulate_query(self, question: str, options: Dict[str, str] = None) -> str:
+        """Reformulate query to extract key concepts and keywords for better retrieval"""
+        
+        # If reformulation is disabled, return original question
+        if not self.config.REFORMULATION_ENABLED:
+            return question
+        
+        # Check if generation model is available
+        if self.generation_model is None or self.tokenizer is None:
+            self.logger.log_info("Generation model not available, skipping reformulation")
+            return question
+        
+        try:
+            # Format options if provided
+            options_text = ""
+            if options:
+                options_text = "\nCác lựa chọn: " + ", ".join([f"{k}: {v}" for k, v in options.items()])
+            
+            # Create reformulation prompt in Vietnamese
+            messages = [{"role": "user",
+                "content": 
+                    f"""Bạn là một trợ lý AI chuyên tối ưu hóa câu hỏi tìm kiếm cho hệ thống RAG.
+                    Nhiệm vụ của bạn là tạo ra một câu hỏi tìm kiếm được tối ưu hóa từ câu hỏi trắc nghiệm gốc.
+                    
+                    Câu hỏi gốc: {question}{options_text}
+                    
+                    Hướng dẫn:
+                    1. Trích xuất các từ khóa và khái niệm chính từ câu hỏi
+                    2. Nếu câu hỏi đã đủ ngắn gọn, thì không cần tối ưu hóa thêm
+                    3. Tạo câu hỏi tìm kiếm ngắn gọn, tập trung vào giữ nguyên ý nghĩa và ngữ cảnh của câu hỏi gốc
+                    
+                    Chỉ trả về câu hỏi tìm kiếm đã được tối ưu hóa, không có giải thích thêm.
+                """
+            }]
+            
+            # Apply chat template
+            text = self.tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True
+            )
+            
+            # Tokenize input
+            inputs = self.tokenizer(text, return_tensors="pt")
+            
+            # Move to device
+            device = next(self.generation_model.parameters()).device
+            inputs = {k: v.to(device) for k, v in inputs.items()}
+            
+            # Generate reformulated query
+            with torch.no_grad():
+                outputs = self.generation_model.generate(
+                    **inputs,
+                    max_new_tokens=self.config.REFORMULATION_MAX_TOKENS,
+                    temperature=self.config.REFORMULATION_TEMPERATURE,
+                    do_sample=True,
+                    pad_token_id=self.tokenizer.eos_token_id
+                )
+                
+                # Decode only the new tokens
+                input_length = inputs['input_ids'].shape[1]
+                new_tokens = outputs[:, input_length:]
+                
+                reformulated_query = self.tokenizer.decode(
+                    new_tokens[0], 
+                    skip_special_tokens=True
+                ).strip()
+            
+            # Clear GPU cache after generation
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            
+            # Log reformulation result
+            self.logger.log_info(f"Query reformulation: '{question}' -> '{reformulated_query}'")
+            
+            # Fallback to original if reformulation is empty or too short
+            if not reformulated_query or len(reformulated_query) < 5:
+                self.logger.log_info("Reformulated query too short, using original question")
+                return question
+            
+            return reformulated_query
+            
+        except Exception as e:
+            self.logger.log_error(f"Error in query reformulation: {str(e)}")
+            # Fallback to original question on error
+            return question
+    
     def parse_answer(self, response: str) -> List[str]:
         """Parse model response to extract answer choices from enhanced format"""
         
@@ -566,9 +654,12 @@ class VietnameseMCQRAG:
         """Answer a single MCQ question using retrieval + custom generation"""
         
         try:
+            # Reformulate query for better retrieval
+            reformulated_query = self.reformulate_query(question, options)
+            
             # Retrieve relevant context using our custom Qwen3 retriever
             # Query will be automatically formatted with instruction prefix in the embedding model
-            nodes = self.retriever.retrieve(question)
+            nodes = self.retriever.retrieve(reformulated_query)
             
             # Combine context from retrieved nodes
             context_parts = []
@@ -593,9 +684,12 @@ class VietnameseMCQRAG:
         """Answer MCQ question with debug information"""
         
         try:
+            # Reformulate query for better retrieval
+            reformulated_query = self.reformulate_query(question, options)
+            
             # Retrieve relevant context using custom Qwen3 retriever
             # Query formatting with instruction prefix is handled automatically
-            nodes = self.retriever.retrieve(question)
+            nodes = self.retriever.retrieve(reformulated_query)
             
             # Combine context and collect metadata
             context_parts = []
@@ -617,6 +711,8 @@ class VietnameseMCQRAG:
             parsed_answers = self.parse_answer(raw_response)
             
             return {
+                'original_query': question,
+                'reformulated_query': reformulated_query,
                 'retrieved_chunks': retrieved_chunks,
                 'context': context,
                 'raw_response': raw_response,
@@ -626,6 +722,8 @@ class VietnameseMCQRAG:
         except Exception as e:
             self.logger.log_error(f"Error in debug MCQ: {str(e)}")
             return {
+                'original_query': question,
+                'reformulated_query': question,  # Fallback to original on error
                 'retrieved_chunks': [],
                 'context': "",
                 'raw_response': f"Error: {str(e)}",
@@ -636,9 +734,17 @@ class VietnameseMCQRAG:
         """Retrieve relevant chunks for a question with debug info"""
         
         try:
+            # Reformulate query for better retrieval
+            reformulated_query = self.reformulate_query(question)
+            
+            # Display original and reformulated queries
+            print(f"Original Query: {question}")
+            print(f"Reformulated Query: {reformulated_query}")
+            print("-" * 50)
+            
             # Retrieve relevant context using custom Qwen3 retriever
             # Query formatting with instruction prefix is handled automatically
-            nodes = self.retriever.retrieve(question)
+            nodes = self.retriever.retrieve(reformulated_query)
             
             retrieved_chunks = []
             for node in nodes:
@@ -661,7 +767,6 @@ class VietnameseMCQRAG:
         self.setup_embedding_model()
         self.setup_generation_model()
         
-        # Load and process documents
         documents = self.load_documents()
         
         # Create vector index
@@ -713,21 +818,8 @@ class VietnameseMCQRAG:
             index_exists = es_client.indices.exists(index=self.config.ELASTICSEARCH_INDEX)
             
             if index_exists and not force_rebuild:
-                self.logger.log_info(f"Loading existing Elasticsearch index: {self.config.ELASTICSEARCH_INDEX}")
-                
-                # Tạo ElasticsearchStore từ existing index
-                vector_store = ElasticsearchStore(
-                    index_name=self.config.ELASTICSEARCH_INDEX,
-                    es_client=es_client,
-                )
-                
-                # Load index từ vector store
-                self.index = VectorStoreIndex.from_vector_store(
-                    vector_store=vector_store,
-                    embed_model=Settings.embed_model
-                )
-                
-                self.logger.log_info("Elasticsearch index loaded successfully")
+                # Index đã được load ở initialize(), không cần làm gì thêm
+                self.logger.log_info(f"Index already loaded in initialize()")
                 return
                 
             elif index_exists and force_rebuild:
@@ -735,7 +827,11 @@ class VietnameseMCQRAG:
                 es_client.indices.delete(index=self.config.ELASTICSEARCH_INDEX)
             
         except Exception as e:
-            self.logger.log_info(f"Could not load existing index ({str(e)}), creating new one...")
+            self.logger.log_info(f"Could not check existing index ({str(e)}), creating new one...")
+        
+        # Validate documents required for new index
+        if documents is None or len(documents) == 0:
+            raise ValueError("Documents are required for creating new index")
         
         self.logger.log_info("Creating new Elasticsearch index with hybrid retrieval support...")
         
@@ -759,6 +855,17 @@ class VietnameseMCQRAG:
             show_progress=True,
             # transformations are applied automatically from Settings
         )
+
+        # Flush và refresh index để đảm bảo dữ liệu được lưu vào disk
+        try:
+            if es_client.indices.exists(index=self.config.ELASTICSEARCH_INDEX):
+                es_client.indices.flush(index=self.config.ELASTICSEARCH_INDEX)
+                es_client.indices.refresh(index=self.config.ELASTICSEARCH_INDEX)
+                self.logger.log_info("Elasticsearch index flushed and refreshed - data persisted to disk")
+            else:
+                self.logger.log_info("Index not found, skipping flush/refresh")
+        except Exception as e:
+            self.logger.log_error(f"Could not flush/refresh index: {str(e)}")
         
         self.logger.log_info("Elasticsearch index created successfully with hybrid retrieval support")
 
@@ -863,45 +970,6 @@ class VietnameseMCQRAG:
         
         return hybrid_retriever
 
-
-    def create_elasticsearch_mapping(self, es_client):
-        """Create Elasticsearch index mapping for hybrid retrieval (optional - not used by default)"""
-        
-        mapping = {
-            "mappings": {
-                "properties": {
-                    "text": {
-                        "type": "text",
-                        "analyzer": "standard",  # Hoặc "vi_analyzer" nếu có Vietnamese analyzer
-                        "fields": {
-                            "keyword": {
-                                "type": "keyword"
-                            }
-                        }
-                    },
-                    "embedding": {
-                        "type": "dense_vector",
-                        "dims": 1024,  # Dimension của Qwen3-Embedding-0.6B (cần check actual dimension)
-                        "index": True,
-                        "similarity": "cosine"
-                    },
-                    "metadata": {
-                        "type": "object",
-                        "enabled": True
-                    }
-                }
-            }
-        }
-        
-        try:
-            es_client.indices.create(
-                index=self.config.ELASTICSEARCH_INDEX,
-                body=mapping
-            )
-            self.logger.log_info("Custom Elasticsearch mapping created successfully")
-        except Exception as e:
-            self.logger.log_error(f"Failed to create custom mapping: {str(e)}")
-            # ElasticsearchStore sẽ tự tạo mapping nếu không có
 
 
 
