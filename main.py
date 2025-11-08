@@ -238,78 +238,27 @@ def run_evaluation(args):
         print("Check the log file for detailed error information.")
         return 1
 
-
-def run_single_test(args):
-    """Run a single question test"""
-    
-    print_banner()
-    
-    config = RAGConfig()
-    if args.document:
-        config.DOCUMENT_PATH = args.document
-    
-    try:
-        print("🚀 Initializing RAG system...")
-        rag_system = VietnameseMCQRAG(config)
-        rag_system.initialize()
-        
-        # Interactive question input
-        print("\n📝 Enter your question:")
-        question = input("Question: ")
-        
-        print("\nEnter options:")
-        options = {}
-        for letter in ['A', 'B', 'C', 'D']:
-            option = input(f"Option {letter}: ")
-            options[letter] = option
-        
-        print(f"\n🔍 Processing question...")
-        start_time = datetime.now()
-        
-        answers = rag_system.answer_mcq(question, options)
-        
-        end_time = datetime.now()
-        processing_time = (end_time - start_time).total_seconds()
-        
-        print(f"\n📋 Results:")
-        print(f"Question: {question}")
-        print(f"Predicted Answers: {', '.join(answers) if answers else 'None'}")
-        print(f"Processing Time: {processing_time:.2f}s")
-        
-        return 0
-        
-    except Exception as e:
-        print(f"\n❌ Error: {str(e)}")
-        return 1
-
-
 def main():
     """Main entry point"""
     
     parser = argparse.ArgumentParser(
         description="Vietnamese MCQ RAG System",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  # Run full evaluation
-  python main.py evaluate
+        epilog=
+    """
+    Examples:
+    # Run full evaluation
+    python main.py evaluate 
+    python main.py evaluate --workers 4 --limit 200 --random
+    python main.py evaluate --workers 4 --range "100-200"
 
-  # Run with custom files
-  python main.py evaluate --questions my_questions.csv --ground-truth my_results.md
+    # Rebuild index and run evaluation
+    python main.py evaluate --rebuild-index
 
-  # Rebuild index and run evaluation
-  python main.py evaluate --rebuild-index
-
-  # Test single question interactively
-  python main.py test --rebuild-index
-
-  # Debug specific question
-  python main.py debug 3
-  # Then interactively debug more questions: 5, 10, q
-
-  # Run with more parallel workers
-  python main.py evaluate --workers 4
-        """
+    # Debug specific question
+    python main.py debug 3
+    # Then interactively debug more questions: 5, 10, q
+    """
     )
     
     subparsers = parser.add_subparsers(dest='command', help='Commands')
@@ -346,11 +295,7 @@ Examples:
                            help='Quick mode: faster but less accurate')
     eval_parser.add_argument('--accurate', action='store_true',
                            help='Accurate mode: slower but more accurate')
-    
-    # Test command
-    test_parser = subparsers.add_parser('test', help='Test with single question')
-    test_parser.add_argument('--document', '-d',
-                           help='Path to document file')
+
     
     # Debug command
     debug_parser = subparsers.add_parser('debug', help='Debug specific question interactively')
@@ -370,8 +315,6 @@ Examples:
     
     if args.command == 'evaluate':
         return run_evaluation(args)
-    elif args.command == 'test':
-        return run_single_test(args)
     elif args.command == 'debug':
         return run_debug(args)
     else:

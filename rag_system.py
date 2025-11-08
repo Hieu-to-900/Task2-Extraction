@@ -24,6 +24,14 @@ from llama_index.vector_stores.elasticsearch import ElasticsearchStore
 from elasticsearch import Elasticsearch
 from llama_index.retrievers.bm25 import BM25Retriever
 
+# Import question classifier
+from question_classifier import QuestionClassifier
+
+# Import reranker
+import sys
+sys.path.append(os.path.join(os.path.dirname(__file__), 'testing-features'))
+from qwen3_reranker_transformers import Qwen3Reranker
+
 class RAGConfig:
     """Configuration for RAG system"""
     # Model configurations
@@ -48,12 +56,20 @@ class RAGConfig:
     
     # Hybrid retrieval parameters
     HYBRID_ALPHA = 0.5  # 0.0 = chỉ keyword, 1.0 = chỉ vector, 0.5 = balanced
-    HYBRID_TOP_K = 10    # Số kết quả từ mỗi method trong hybrid search
+    HYBRID_TOP_K = 10    # Số kết quả từ mỗi method trong hybrid search (10 vector + 10 keyword = 20)
+    HYBRID_COMBINED_TOP_K = 10  # Số kết quả sau khi combine (từ 20 → 10)
     
     # Query reformulation parameters
     REFORMULATION_ENABLED = True  # Enable/disable query reformulation
     REFORMULATION_TEMPERATURE = 0.7  # Temperature for reformulation generation
     REFORMULATION_MAX_TOKENS = 1024  # Maximum tokens for reformulated query
+    
+    # Reranker parameters
+    RERANKER_MODEL = "Qwen/Qwen3-Reranker-0.6B"
+    RERANKER_ENABLED = True  # Enable/disable reranker
+    RERANKER_MAX_LENGTH = 2048  # Maximum length for reranker input
+    RERANKER_TOP_K = 5  # Số kết quả sau rerank (từ 10 → 5)
+    RERANKER_INSTRUCTION = "Given the user query, retrieve the relevant passages that answer the query"
 
 class Qwen3EmbeddingLlamaIndex(BaseEmbedding):
     """Custom Qwen3 Embedding class integrated with LlamaIndex"""
@@ -258,6 +274,8 @@ class VietnameseMCQRAG:
         self.query_engine = None
         self.generation_model = None
         self.tokenizer = None
+        self._classifier = None  # Lazy initialization of question classifier
+        self.reranker = None  # Reranker model
         
     def setup_embedding_model(self):
         """Setup custom Qwen3 embedding model with GPU optimization"""
@@ -291,6 +309,35 @@ class VietnameseMCQRAG:
         
         self.logger.log_info("Custom Qwen3 embedding model setup completed")
         return embed_model
+    
+    def setup_reranker(self):
+        """Setup Qwen3 Reranker model"""
+        if not self.config.RERANKER_ENABLED:
+            self.logger.log_info("Reranker is disabled in config")
+            return
+        
+        try:
+            self.logger.log_info(f"Loading reranker model: {self.config.RERANKER_MODEL}")
+            
+            # Check GPU availability
+            device_available = torch.cuda.is_available()
+            if device_available:
+                gpu_name = torch.cuda.get_device_name(0)
+                self.logger.log_info(f"Reranker will use GPU: {gpu_name}")
+            
+            # Initialize reranker
+            self.reranker = Qwen3Reranker(
+                model_name_or_path=self.config.RERANKER_MODEL,
+                max_length=self.config.RERANKER_MAX_LENGTH,
+                instruction=self.config.RERANKER_INSTRUCTION
+            )
+            
+            self.logger.log_info("Reranker model loaded successfully")
+            
+        except Exception as e:
+            self.logger.log_error(f"Failed to load reranker model: {str(e)}")
+            self.logger.log_info("Continuing without reranker...")
+            self.reranker = None
     
     def setup_generation_model(self):
         """Setup Qwen3-0.6B generation model"""
@@ -417,16 +464,20 @@ class VietnameseMCQRAG:
             self.logger.log_error("Failed to setup query engine", e)
             raise
     
-    def generate_answer_with_qwen3(self, context: str, question: str, options: Dict[str, str]) -> str:
+    def generate_answer_with_qwen3(self, context: str, question: str, 
+                                   options: Dict[str, str], 
+                                   custom_prompt: str = None) -> str:
         """Generate answer using Qwen3-0.6B model with chat format"""
         
-        # Format options
-        options_text = ", ".join([f"{k}: {v}" for k, v in options.items()])
-        
-        # Create messages in chat format for Qwen3
-        messages = [{"role": "user",
-            "content": 
-                f"""Bạn là một trợ lý AI chuyên trả lời câu hỏi trắc nghiệm tiếng Việt.
+        # Sử dụng custom prompt nếu có, nếu không dùng prompt mặc định
+        if custom_prompt is None:
+            # Format options
+            options_text = ", ".join([f"{k}: {v}" for k, v in options.items()])
+            
+            # Create messages in chat format for Qwen3
+            messages = [{"role": "user",
+                "content": 
+                    f"""Bạn là một trợ lý AI chuyên trả lời câu hỏi trắc nghiệm tiếng Việt.
                     Context thông tin:
                     {context}
 
@@ -438,8 +489,10 @@ class VietnameseMCQRAG:
                     2. Phân tích từng lựa chọn dựa trên thông tin trong context
                     3. Trả lời theo định dạng chính xác: "Đáp án đúng: [danh sách các đáp án]" (ví dụ: "Đáp án đúng: A, C")
                     4. Nếu không tìm thấy thông tin trong context, trả lời: "Không có thông tin đủ để trả lời"
-                """
-            }]
+                    """
+                }]
+        else:
+            messages = [{"role": "user", "content": custom_prompt}]
         
         try:
             # Apply chat template
@@ -582,42 +635,366 @@ class VietnameseMCQRAG:
             # Fallback to original question on error
             return question
     
+    def classify_question(self, question: str) -> str:
+        """Phân loại câu hỏi"""
+        if self._classifier is None:
+            self._classifier = QuestionClassifier()
+        return self._classifier.classify(question)
+    
+    def adaptive_retrieval(self, question: str, q_type: str, 
+                          reformulated_query: str = None) -> List:
+        """Retrieval thích ứng theo loại câu hỏi"""
+        
+        if reformulated_query is None:
+            reformulated_query = question
+        
+        try:
+            # Điều chỉnh TOP_K theo loại câu hỏi
+            if q_type == 'calculation':
+                # Tăng TOP_K cho câu hỏi tính toán để tìm công thức
+                top_k = min(self.config.TOP_K * 2, 20)
+                nodes = self.retriever.retrieve(reformulated_query)
+                # Sắp xếp lại theo mức độ chứa số liệu
+                nodes = sorted(nodes, key=lambda n: self._has_numbers(n.text), reverse=True)
+                nodes = nodes[:top_k]
+                # Rerank với reranker
+                nodes = self.rerank_nodes(nodes, reformulated_query)
+                return nodes
+            
+            elif q_type == 'table_data':
+                # Tìm chunks chứa từ khóa "bảng", "table"
+                query = f"{reformulated_query} bảng table"
+                nodes = self.retriever.retrieve(query)
+                # Ưu tiên chunks có từ "bảng"
+                nodes = sorted(nodes, key=lambda n: self._has_table_keywords(n.text), reverse=True)
+                nodes = nodes[:self.config.TOP_K * 2]  # Lấy nhiều hơn để rerank
+                # Rerank với reranker
+                nodes = self.rerank_nodes(nodes, reformulated_query)
+                return nodes[:self.config.TOP_K]
+            
+            elif q_type == 'document_comprehension':
+                # Tìm tên tài liệu cụ thể (Public_XXX)
+                doc_match = re.search(r'public_(\d+)', question.lower())
+                if doc_match:
+                    doc_id = doc_match.group(1)
+                    # Tìm chunks từ tài liệu cụ thể
+                    nodes = self._retrieve_by_document(doc_id, reformulated_query)
+                    if nodes:
+                        # Rerank với reranker
+                        nodes = self.rerank_nodes(nodes, reformulated_query)
+                        return nodes[:self.config.TOP_K]
+                
+                # Nếu không tìm thấy tài liệu cụ thể, dùng retrieval thông thường
+                top_k = min(self.config.TOP_K * 2, 20)
+                nodes = self.retriever.retrieve(reformulated_query)
+                nodes = nodes[:top_k]
+                # Rerank với reranker
+                nodes = self.rerank_nodes(nodes, reformulated_query)
+                return nodes
+            
+            elif q_type == 'definition':
+                # Ưu tiên chunks ngắn, chứa định nghĩa
+                nodes = self.retriever.retrieve(reformulated_query)
+                # Sắp xếp theo độ dài (định nghĩa thường ngắn) và có từ khóa định nghĩa
+                nodes = sorted(nodes, key=lambda n: (
+                    -self._has_definition_keywords(n.text),
+                    len(n.text)
+                ))
+                nodes = nodes[:self.config.TOP_K * 2]  # Lấy nhiều hơn để rerank
+                # Rerank với reranker
+                nodes = self.rerank_nodes(nodes, reformulated_query)
+                return nodes[:self.config.TOP_K]
+            
+            elif q_type == 'explanation':
+                # Tăng TOP_K cho câu hỏi giải thích để có đủ context
+                top_k = min(self.config.TOP_K * 2, 20)
+                nodes = self.retriever.retrieve(reformulated_query)
+                nodes = nodes[:top_k]
+                # Rerank với reranker
+                nodes = self.rerank_nodes(nodes, reformulated_query)
+                return nodes
+            
+            else:
+                # Retrieval thông thường
+                nodes = self.retriever.retrieve(reformulated_query)
+                nodes = nodes[:self.config.TOP_K * 2]  # Lấy nhiều hơn để rerank
+                # Rerank với reranker
+                nodes = self.rerank_nodes(nodes, reformulated_query)
+                return nodes[:self.config.TOP_K]
+                
+        except Exception as e:
+            self.logger.log_error(f"Error in adaptive retrieval: {str(e)}")
+            # Fallback to normal retrieval
+            nodes = self.retriever.retrieve(reformulated_query)
+            nodes = nodes[:self.config.TOP_K * 2]  # Lấy nhiều hơn để rerank
+            # Rerank với reranker
+            nodes = self.rerank_nodes(nodes, reformulated_query)
+            return nodes[:self.config.TOP_K]
+    
+    def _has_numbers(self, text: str) -> int:
+        """Đếm số lượng số trong text"""
+        numbers = re.findall(r'\d+\.?\d*', text)
+        return len(numbers)
+    
+    def _has_table_keywords(self, text: str) -> int:
+        """Đếm số lượng từ khóa liên quan đến bảng"""
+        keywords = ['bảng', 'table', 'bảng \d+', 'table \d+']
+        count = 0
+        text_lower = text.lower()
+        for keyword in keywords:
+            count += len(re.findall(keyword, text_lower))
+        return count
+    
+    def _has_definition_keywords(self, text: str) -> int:
+        """Đếm số lượng từ khóa định nghĩa"""
+        keywords = ['định nghĩa', 'là', 'được gọi', 'khái niệm', 'nghĩa là']
+        count = 0
+        text_lower = text.lower()
+        for keyword in keywords:
+            count += len(re.findall(keyword, text_lower))
+        return count
+    
+    def _retrieve_by_document(self, doc_id: str, query: str) -> List:
+        """Retrieve chunks từ tài liệu cụ thể"""
+        try:
+            # Tìm tất cả nodes
+            all_nodes = []
+            if hasattr(self.index, 'storage_context') and hasattr(self.index.storage_context, 'docstore'):
+                for node_id in self.index.storage_context.docstore.docs:
+                    node = self.index.storage_context.docstore.get_node(node_id)
+                    if node and hasattr(node, 'metadata'):
+                        # Kiểm tra metadata có chứa doc_id không
+                        metadata = node.metadata
+                        if isinstance(metadata, dict):
+                            file_name = metadata.get('file_name', '')
+                            if f'public_{doc_id}' in file_name.lower() or f'public-{doc_id}' in file_name.lower():
+                                all_nodes.append(node)
+            
+            # Nếu tìm thấy nodes từ tài liệu cụ thể, retrieve từ đó
+            if all_nodes:
+                # Tạo retriever tạm thời từ nodes này
+                from llama_index.core.retrievers import VectorIndexRetriever
+                temp_retriever = VectorIndexRetriever(
+                    index=self.index,
+                    similarity_top_k=min(len(all_nodes), self.config.TOP_K * 2)
+                )
+                nodes = temp_retriever.retrieve(query)
+                # Lọc chỉ lấy nodes từ tài liệu cụ thể
+                filtered_nodes = []
+                for n in nodes:
+                    metadata = getattr(n, 'metadata', {})
+                    if isinstance(metadata, dict):
+                        file_name = str(metadata.get('file_name', '')).lower()
+                        if f'public_{doc_id}' in file_name or f'public-{doc_id}' in file_name:
+                            filtered_nodes.append(n)
+                return filtered_nodes if filtered_nodes else nodes
+            
+            return []
+        except Exception as e:
+            self.logger.log_error(f"Error retrieving by document: {str(e)}")
+            return []
+    
+    def rerank_nodes(self, nodes: List, query: str, instruction: str = None) -> List:
+        """
+        Rerank nodes using Qwen3Reranker
+        
+        Args:
+            nodes: List of nodes to rerank
+            query: Original query/question
+            instruction: Optional custom instruction for reranker
+            
+        Returns:
+            Reranked list of nodes sorted by relevance score
+        """
+        # If reranker is not enabled or not available, return original nodes
+        if not self.config.RERANKER_ENABLED or self.reranker is None:
+            return nodes
+        
+        if not nodes:
+            return nodes
+        
+        try:
+            # Prepare query-document pairs for reranker
+            pairs = [(query, node.text) for node in nodes]
+            
+            # Use custom instruction if provided, otherwise use default
+            reranker_instruction = instruction or self.config.RERANKER_INSTRUCTION
+            
+            # Compute reranking scores
+            scores = self.reranker.compute_scores(pairs, instruction=reranker_instruction)
+            
+            # Combine nodes with scores
+            nodes_with_scores = list(zip(nodes, scores))
+            
+            # Sort by score (descending)
+            nodes_with_scores.sort(key=lambda x: x[1], reverse=True)
+            
+            # Update node scores with reranker scores
+            reranked_nodes = []
+            for node, score in nodes_with_scores:
+                node.score = score  # Update score attribute
+                reranked_nodes.append(node)
+            
+            # Apply TOP_K if specified
+            if self.config.RERANKER_TOP_K is not None:
+                reranked_nodes = reranked_nodes[:self.config.RERANKER_TOP_K]
+            
+            self.logger.log_info(f"Reranked {len(nodes)} nodes, keeping top {len(reranked_nodes)}")
+            
+            return reranked_nodes
+            
+        except Exception as e:
+            self.logger.log_error(f"Error in reranking: {str(e)}")
+            # Fallback: return original nodes
+            return nodes
+    
+    def generate_adaptive_prompt(self, question: str, q_type: str, 
+                                context: str, options: Dict[str, str]) -> str:
+        """Tạo prompt thích ứng theo loại câu hỏi"""
+        
+        # Format options
+        options_text = ", ".join([f"{k}: {v}" for k, v in options.items()])
+        
+        base_prompt = f"""Bạn là một trợ lý AI chuyên trả lời câu hỏi trắc nghiệm tiếng Việt.
+Context thông tin:
+{context}
+
+Câu hỏi: {question}
+Các lựa chọn: {options_text}
+"""
+        
+        # Hướng dẫn theo loại câu hỏi
+        type_specific_instructions = {
+            'calculation': """
+Hướng dẫn đặc biệt cho câu hỏi TÍNH TOÁN:
+1. Tìm công thức hoặc phương pháp tính trong context
+2. Xác định các giá trị đã cho trong câu hỏi
+3. Thay thế các giá trị vào công thức
+4. Thực hiện tính toán cẩn thận từng bước
+5. So sánh kết quả với các lựa chọn (chú ý làm tròn số)
+6. Chọn đáp án có giá trị gần nhất hoặc khớp chính xác
+7. Trả lời theo định dạng: "Đáp án đúng: [danh sách]" (ví dụ: "Đáp án đúng: A")
+""",
+            
+            'table_data': """
+Hướng dẫn đặc biệt cho câu hỏi BẢNG DỮ LIỆU:
+1. Tìm bảng hoặc dữ liệu số liệu trong context
+2. Đọc chính xác giá trị từ bảng (chú ý đơn vị)
+3. Thực hiện phép tính nếu cần (tổng, trung bình, phần trăm)
+4. So sánh kết quả với các lựa chọn
+5. Chọn đáp án khớp với dữ liệu trong bảng
+6. Trả lời theo định dạng: "Đáp án đúng: [danh sách]"
+""",
+            
+            'document_comprehension': """
+Hướng dẫn đặc biệt cho câu hỏi HIỂU TÀI LIỆU:
+1. Tìm nội dung chính của tài liệu được đề cập trong context
+2. Tóm tắt ý chính, không đi vào chi tiết quá mức
+3. So sánh với các lựa chọn để tìm mô tả phù hợp nhất
+4. Chọn đáp án mô tả đúng nội dung chính của tài liệu
+5. Trả lời theo định dạng: "Đáp án đúng: [danh sách]"
+""",
+            
+            'comparison': """
+Hướng dẫn đặc biệt cho câu hỏi SO SÁNH:
+1. Tìm thông tin về cả hai đối tượng cần so sánh trong context
+2. Liệt kê điểm giống và khác nhau
+3. Chọn đáp án mô tả chính xác sự khác biệt hoặc điểm giống nhau
+4. Trả lời theo định dạng: "Đáp án đúng: [danh sách]"
+""",
+            
+            'definition': """
+Hướng dẫn đặc biệt cho câu hỏi ĐỊNH NGHĨA:
+1. Tìm định nghĩa chính xác trong context
+2. Không suy luận, chỉ dựa vào thông tin có sẵn trong context
+3. So sánh từng lựa chọn với định nghĩa trong context
+4. Chọn đáp án khớp chính xác với định nghĩa
+5. Trả lời theo định dạng: "Đáp án đúng: [danh sách]"
+""",
+            
+            'procedure': """
+Hướng dẫn đặc biệt cho câu hỏi QUY TRÌNH:
+1. Tìm các bước, thứ tự, quy trình trong context
+2. Đọc kỹ thứ tự các bước
+3. So sánh với các lựa chọn để tìm thứ tự đúng
+4. Chọn đáp án mô tả đúng quy trình
+5. Trả lời theo định dạng: "Đáp án đúng: [danh sách]"
+""",
+            
+            'explanation': """
+Hướng dẫn đặc biệt cho câu hỏi GIẢI THÍCH:
+1. Tìm thông tin về nguyên lý, cơ chế hoạt động trong context
+2. Phân tích chi tiết cách hoạt động
+3. So sánh với các lựa chọn để tìm mô tả đúng nhất
+4. Chọn đáp án giải thích chính xác nhất
+5. Trả lời theo định dạng: "Đáp án đúng: [danh sách]"
+""",
+            
+            'identification': """
+Hướng dẫn đặc biệt cho câu hỏi NHẬN DẠNG:
+1. Tìm thông tin về thành phần, mô hình, công nghệ trong context
+2. Xác định đặc điểm của từng lựa chọn
+3. So sánh với thông tin trong context
+4. Chọn đáp án đúng hoặc loại bỏ đáp án sai (nếu câu hỏi là "đâu không phải")
+5. Trả lời theo định dạng: "Đáp án đúng: [danh sách]"
+""",
+            
+            'application': """
+Hướng dẫn đặc biệt cho câu hỏi ỨNG DỤNG:
+1. Tìm thông tin về ứng dụng, mục đích sử dụng trong context
+2. Xác định vai trò, chức năng của từng lựa chọn
+3. So sánh với thông tin trong context
+4. Chọn đáp án mô tả đúng ứng dụng
+5. Trả lời theo định dạng: "Đáp án đúng: [danh sách]"
+""",
+            
+            'reason': """
+Hướng dẫn đặc biệt cho câu hỏi LÝ DO:
+1. Tìm thông tin về nguyên nhân, lý do trong context
+2. Phân tích mối quan hệ nhân quả
+3. So sánh với các lựa chọn
+4. Chọn đáp án giải thích đúng lý do
+5. Trả lời theo định dạng: "Đáp án đúng: [danh sách]"
+""",
+        }
+        
+        instruction = type_specific_instructions.get(q_type, """
+Hướng dẫn chung:
+1. Đọc kỹ context và câu hỏi
+2. Phân tích từng lựa chọn dựa trên thông tin trong context
+3. Chọn đáp án đúng nhất dựa trên thông tin có sẵn
+4. Trả lời theo định dạng chính xác: "Đáp án đúng: [danh sách các đáp án]" (ví dụ: "Đáp án đúng: A, C")
+5. Nếu không tìm thấy thông tin đủ trong context, trả lời: "Không có thông tin đủ để trả lời"
+""")
+        
+        return base_prompt + instruction
+    
     def parse_answer(self, response: str) -> List[str]:
         """Parse model response to extract answer choices from enhanced format"""
         
         # Handle empty or None response
         if not response or not response.strip():
-            return []
+            return ['E']  # Return E for debug if empty
         
         try:
-            # Enhanced regex patterns for new format
+            # Patterns to find "Đáp án đúng: B, C" format
             patterns = [
-                # New format patterns
                 r"Đáp án đúng:\s*([A-D,\s]+)",
                 r"đáp án đúng:\s*([A-D,\s]+)",
                 r"KẾT LUẬN:\s*.*?Đáp án đúng:\s*([A-D,\s]+)",
                 r"\*\*KẾT LUẬN:\*\*\s*.*?Đáp án đúng:\s*([A-D,\s]+)",
-                
-                # Fallback patterns
-                r"Đáp án:\s*([A-D,\s]+)",
-                r"đáp án:\s*([A-D,\s]+)",
-                r"Chọn:\s*([A-D,\s]+)",
-                r"chọn:\s*([A-D,\s]+)",
-                
-                # Final fallback - any sequence of A-D with commas (fixed pattern)
-                r"[A-D](?:\s*,\s*[A-D])*",
             ]
             
+            # Try each pattern and find ALL matches, use the LAST one (usually conclusion)
             for pattern in patterns:
                 try:
-                    match = re.search(pattern, response, re.DOTALL | re.IGNORECASE)
-                    if match:
-                        if match.groups():  # If pattern has groups
-                            answer_text = match.group(1).strip()
-                        else:  # If pattern has no groups (like the fixed final fallback)
-                            answer_text = match.group(0).strip()
+                    matches = list(re.finditer(pattern, response, re.DOTALL | re.IGNORECASE))
+                    if matches:
+                        # Use the last match (usually the final conclusion)
+                        match = matches[-1]
+                        answer_text = match.group(1).strip()
                         
-                        # Extract individual letters
+                        # Extract individual letters A-D
                         answers = re.findall(r'[A-D]', answer_text.upper())
                         if answers:
                             return sorted(list(set(answers)))  # Remove duplicates and sort
@@ -625,53 +1002,43 @@ class VietnameseMCQRAG:
                     # Log regex error and continue to next pattern
                     continue
             
-            # If no pattern matches, try to find any A-D letters in conclusion section
-            try:
-                conclusion_match = re.search(r"KẾT LUẬN:.*", response, re.DOTALL | re.IGNORECASE)
-                if conclusion_match:
-                    conclusion_text = conclusion_match.group(0)
-                    letters = re.findall(r'[A-D]', conclusion_text.upper())
-                    if letters:
-                        return sorted(list(set(letters)))
-            except re.error:
-                pass
-            
-            # Final fallback - any A-D letters in response
-            try:
-                letters = re.findall(r'[A-D]', response.upper())
-                if letters:
-                    return sorted(list(set(letters)))
-            except re.error:
-                pass
+            # If no pattern matches, return E for debug
+            self.logger.log_info(f"Could not parse answer from response. Returning E for debug.")
+            return ['E']
                 
         except Exception as e:
             # Log parsing error but don't crash
             self.logger.log_error(f"Error parsing answer from response: {str(e)}")
-        
-        return []
+            return ['E']  # Return E for debug on error
     
     def answer_mcq(self, question: str, options: Dict[str, str]) -> List[str]:
-        """Answer a single MCQ question using retrieval + custom generation"""
+        """Answer a single MCQ question using adaptive retrieval + custom generation"""
         
         try:
-            # Reformulate query for better retrieval
+            # 1. Phân loại câu hỏi
+            q_type = self.classify_question(question)
+            self.logger.log_info(f"Question classified as: {q_type}")
+            
+            # 2. Reformulate query for better retrieval
             reformulated_query = self.reformulate_query(question, options)
             
-            # Retrieve relevant context using our custom Qwen3 retriever
-            # Query will be automatically formatted with instruction prefix in the embedding model
-            nodes = self.retriever.retrieve(reformulated_query)
+            # 3. Adaptive retrieval theo loại câu hỏi
+            nodes = self.adaptive_retrieval(question, q_type, reformulated_query)
             
-            # Combine context from retrieved nodes
+            # 4. Combine context from retrieved nodes
             context_parts = []
             for node in nodes:
                 context_parts.append(node.text)
             
             context = "\n\n".join(context_parts)
             
-            # Generate answer using Qwen3 model
-            response = self.generate_answer_with_qwen3(context, question, options)
+            # 5. Tạo prompt thích ứng theo loại câu hỏi
+            adaptive_prompt = self.generate_adaptive_prompt(question, q_type, context, options)
             
-            # Parse answer
+            # 6. Generate answer using Qwen3 model với prompt thích ứng
+            response = self.generate_answer_with_qwen3(context, question, options, adaptive_prompt)
+            
+            # 7. Parse answer
             answers = self.parse_answer(response)
             
             return answers
@@ -684,12 +1051,15 @@ class VietnameseMCQRAG:
         """Answer MCQ question with debug information"""
         
         try:
+            # 1. Phân loại câu hỏi
+            q_type = self.classify_question(question)
+            self.logger.log_info(f"Question classified as: {q_type}")
+            
             # Reformulate query for better retrieval
             reformulated_query = self.reformulate_query(question, options)
             
-            # Retrieve relevant context using custom Qwen3 retriever
-            # Query formatting with instruction prefix is handled automatically
-            nodes = self.retriever.retrieve(reformulated_query)
+            # Adaptive retrieval
+            nodes = self.adaptive_retrieval(question, q_type, reformulated_query)
             
             # Combine context and collect metadata
             context_parts = []
@@ -704,14 +1074,18 @@ class VietnameseMCQRAG:
             
             context = "\n\n".join(context_parts)
             
+            # Generate adaptive prompt
+            adaptive_prompt = self.generate_adaptive_prompt(question, q_type, context, options)
+            
             # Generate answer using Qwen3 model
-            raw_response = self.generate_answer_with_qwen3(context, question, options)
+            raw_response = self.generate_answer_with_qwen3(context, question, options, adaptive_prompt)
             
             # Parse answer
             parsed_answers = self.parse_answer(raw_response)
             
             return {
                 'original_query': question,
+                'question_type': q_type,
                 'reformulated_query': reformulated_query,
                 'retrieved_chunks': retrieved_chunks,
                 'context': context,
@@ -765,6 +1139,7 @@ class VietnameseMCQRAG:
         
         # Setup models
         self.setup_embedding_model()
+        self.setup_reranker()
         self.setup_generation_model()
         
         documents = self.load_documents()
@@ -965,7 +1340,7 @@ class VietnameseMCQRAG:
             vector_retriever=vector_retriever,
             bm25_retriever=bm25_retriever,
             alpha=self.config.HYBRID_ALPHA,
-            top_k=self.config.TOP_K  # Truyền top_k vào
+            top_k=self.config.HYBRID_COMBINED_TOP_K  # Số kết quả sau khi combine (10 từ 20)
         )
         
         return hybrid_retriever

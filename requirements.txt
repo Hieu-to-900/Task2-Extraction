@@ -19,3 +19,6 @@ python-dotenv>=1.0.0
 
 # GPU acceleration for RTX 3090
 accelerate>=0.24.0
+
+# Keyboard input handling for multi-line input
+pynput>=1.7.6

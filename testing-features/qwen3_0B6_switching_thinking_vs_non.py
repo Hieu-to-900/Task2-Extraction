@@ -1,5 +1,8 @@
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import torch
+import sys
+import threading
+from pynput import keyboard
 
 class QwenChatbot:
     def __init__(self, model_name="Qwen/Qwen3-0.6B"):
@@ -48,6 +51,82 @@ class QwenChatbot:
 
         return response
 
+
+def get_multiline_input(prompt="You: "):
+    """
+    Get multi-line input from user. Press Enter to add a new line,
+    Press Shift+Enter to submit the input.
+    """
+    lines = []
+    shift_pressed = threading.Event()
+    submit_flag = threading.Event()
+    listener = None
+    
+    def on_press(key):
+        try:
+            # Check if Shift is pressed
+            if key == keyboard.Key.shift or key == keyboard.Key.shift_l or key == keyboard.Key.shift_r:
+                shift_pressed.set()
+        except AttributeError:
+            pass
+    
+    def on_release(key):
+        try:
+            # Check if Enter is pressed while Shift is held
+            if key == keyboard.Key.enter and shift_pressed.is_set():
+                submit_flag.set()
+                return False  # Stop listener
+            # Reset shift flag when Shift is released
+            if key == keyboard.Key.shift or key == keyboard.Key.shift_l or key == keyboard.Key.shift_r:
+                shift_pressed.clear()
+        except AttributeError:
+            pass
+    
+    # Start keyboard listener in a separate thread
+    listener = keyboard.Listener(on_press=on_press, on_release=on_release)
+    listener.start()
+    
+    try:
+        # Print initial prompt
+        print(f"\n{prompt}", end="", flush=True)
+        
+        # Read lines until Shift+Enter is pressed
+        while not submit_flag.is_set():
+            try:
+                # Read a line (this will block until Enter is pressed)
+                line = sys.stdin.readline()
+                
+                # Check if Shift+Enter was pressed (check immediately after reading)
+                if submit_flag.is_set():
+                    # Shift+Enter was pressed, don't add this line
+                    break
+                
+                # Remove trailing newline
+                if line.endswith('\n'):
+                    line = line[:-1]
+                
+                # Add line to collection
+                lines.append(line)
+                
+                # If it's a regular Enter (not Shift+Enter), continue to next line
+                # Print continuation prompt for next line
+                if not submit_flag.is_set():
+                    print("  ", end="", flush=True)  # Indent for continuation
+                
+            except (EOFError, KeyboardInterrupt):
+                break
+        
+        # Join all lines
+        result = '\n'.join(lines).strip()
+        return result
+        
+    finally:
+        # Stop and cleanup listener
+        if listener and listener.is_alive():
+            listener.stop()
+            listener.join(timeout=0.1)
+
+
 # Example Usage
 if __name__ == "__main__":
     chatbot = QwenChatbot()
@@ -76,11 +155,12 @@ if __name__ == "__main__":
     print("Qwen Chatbot - Interactive Mode")
     print("Type 'exit' or 'quit' to end the conversation")
     print("Use /think or /no_think tags to control thinking mode")
+    print("Multi-line input: Press Enter to add a new line, Shift+Enter to submit")
     print("=" * 50)
 
     while True:
         try:
-            user_input = input("\nYou: ").strip()
+            user_input = get_multiline_input()
             
             if user_input.lower() in ['exit', 'quit']:
                 print("Goodbye!")
